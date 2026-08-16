@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# caelorum-writing-monitor launcher
+set -euo pipefail
+
+APP="$HOME/.local/lib/caelorum-writing-monitor/caelorum-writing-spike"
+SOURCE_PROJECT="/home/ingzo28/Projects/writing-core/caelorum-writing-spike"
+
+if [[ ! -x "$APP" ]]; then
+  printf '%s\n' 'Writing Monitor executable not found.' >&2
+  printf 'Expected: %s\n' "$APP" >&2
+  printf 'Build the release version from: %s\n' "$SOURCE_PROJECT" >&2
+  printf '%s\n' 'Recommended build/install commands:' >&2
+  printf '  cd %s\n' "$SOURCE_PROJECT" >&2
+  printf '  npm run tauri build\n' >&2
+  printf '  ./scripts/install-local.sh\n' >&2
+  exit 127
+fi
+
+case "${1:-}" in
+  "")
+    state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/caelorum-writing-monitor"
+    log_file="$state_dir/launcher.log"
+    mkdir -p "$state_dir"
+    : > "$log_file"
+    nohup env GDK_BACKEND=x11 "$APP" >"$log_file" 2>&1 < /dev/null &
+    pid=$!
+    sleep 0.25
+    if kill -0 "$pid" 2>/dev/null; then
+      printf 'Writing Monitor started (pid %s)\n' "$pid"
+      exit 0
+    fi
+    printf 'Writing Monitor failed to start.\n' >&2
+    printf 'Launcher log: %s\n' "$log_file" >&2
+    tail -n 40 "$log_file" >&2 || true
+    exit 1
+    ;;
+  --foreground)
+    exec env GDK_BACKEND=x11 "$APP"
+    ;;
+  --help|-h)
+    printf '%s\n' 'Usage: writing-monitor [--foreground]'
+    printf '%s\n' '  writing-monitor              Start the installed app in the background.'
+    printf '%s\n' '  writing-monitor --foreground Keep stdout/stderr attached for debugging.'
+    ;;
+  *)
+    printf 'Unknown option: %s\n' "$1" >&2
+    printf '%s\n' 'Usage: writing-monitor [--foreground]' >&2
+    exit 2
+    ;;
+esac
