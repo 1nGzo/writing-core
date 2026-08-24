@@ -102,6 +102,10 @@ type FileDiffPayload = {
   status: CoreStatus;
 };
 
+type TrackingChangedPayload = {
+  document?: MonitorDocument | null;
+};
+
 type WatchErrorPayload = {
   path: string;
   message: string;
@@ -641,6 +645,7 @@ function App() {
     let stopFileDiff: (() => void) | undefined;
     let stopExternal: (() => void) | undefined;
     let stopWatchError: (() => void) | undefined;
+    let stopTrackingChanged: (() => void) | undefined;
     let active = true;
     void listen<FileDiffPayload>("file-diff-event", ({ payload }) => {
       if (payload.path !== monitorPathRef.current) return;
@@ -665,11 +670,44 @@ function App() {
       if (active) stopWatchError = unlisten;
       else unlisten();
     });
+    void listen<TrackingChangedPayload>("tracking-changed", ({ payload }) => {
+      const document = payload.document;
+      if (!document) {
+        documentIdRef.current = null;
+        documentPathRef.current = null;
+        monitorPathRef.current = null;
+        setMonitorPath("");
+        setStatus(emptyStatus);
+        setWatchDiagnostics(emptyWatchDiagnostics);
+        return;
+      }
+      documentIdRef.current = document.document_id;
+      documentPathRef.current = document.path;
+      monitorPathRef.current = document.path;
+      setMode("monitor");
+      setMonitorPath(document.path);
+      setExternalPath(null);
+      setWatchError(null);
+      seenEventIdsRef.current.clear();
+      void Promise.all([
+        invoke<CoreStatus>("get_core_status"),
+        invoke<WatchDiagnostics>("get_watch_diagnostics"),
+      ]).then(([nextStatus, nextDiagnostics]) => {
+        receiveStatus("tracking-changed", nextStatus);
+        setWatchDiagnostics(nextDiagnostics);
+      }).catch((error) => {
+        setWatchError(`同步监控目标失败: ${String(error)}`);
+      });
+    }).then((unlisten) => {
+      if (active) stopTrackingChanged = unlisten;
+      else unlisten();
+    });
     return () => {
       active = false;
       stopFileDiff?.();
       stopExternal?.();
       stopWatchError?.();
+      stopTrackingChanged?.();
     };
   }, []);
 

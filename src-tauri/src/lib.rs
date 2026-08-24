@@ -33,6 +33,7 @@ use writing::{writing_delta, WritingDelta};
 const ALLOWED_EXTENSIONS: [&str; 2] = ["md", "markdown"];
 const FILE_DIFF_DEBOUNCE: Duration = Duration::from_millis(300);
 const FILE_RETRY_DELAY: Duration = Duration::from_millis(150);
+const MAX_LIVE_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
 struct AppState {
     core: Mutex<WritingCore>,
@@ -156,6 +157,30 @@ fn file_diff_summary(previous: &MemorySnapshot, next: &MemorySnapshot) -> Option
     (summary.inserted_chars > 0 || summary.deleted_chars > 0).then_some(summary)
 }
 
+#[derive(Debug)]
+enum LiveSnapshotDecision {
+    StaleRevision,
+    SameSnapshot,
+    Changed(DiffSummary),
+}
+
+fn live_snapshot_decision(
+    previous: &MemorySnapshot,
+    last_editor_revision: Option<u64>,
+    editor_revision: u64,
+    next: &MemorySnapshot,
+) -> Result<LiveSnapshotDecision, String> {
+    if last_editor_revision.is_some_and(|last| editor_revision <= last) {
+        return Ok(LiveSnapshotDecision::StaleRevision);
+    }
+    if previous.hash == next.hash {
+        return Ok(LiveSnapshotDecision::SameSnapshot);
+    }
+    file_diff_summary(previous, next)
+        .map(LiveSnapshotDecision::Changed)
+        .ok_or_else(|| "snapshot changed hash without a text diff".to_string())
+}
+
 struct WatchState {
     path: Option<PathBuf>,
     document_id: Option<String>,
@@ -165,6 +190,7 @@ struct WatchState {
     expected_hash: Option<String>,
     pending_atomic_replace: bool,
     last_external_notice: Option<Instant>,
+    editor_revisions: HashMap<String, u64>,
     generation: u64,
 }
 
@@ -179,6 +205,7 @@ impl Default for WatchState {
             expected_hash: None,
             pending_atomic_replace: false,
             last_external_notice: None,
+            editor_revisions: HashMap::new(),
             generation: 0,
         }
     }
@@ -202,6 +229,38 @@ struct MonitorDocument {
     hash: String,
     mtime_ms: i64,
     size: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct TrackingChangedPayload {
+    document: Option<MonitorDocument>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct TrackApiRequest {
+    path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct LiveSnapshotApiRequest {
+    path: String,
+    content: String,
+    source: String,
+    editor_instance_id: String,
+    editor_revision: u64,
+    #[serde(default)]
+    timestamp_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct LiveSnapshotApiResponse {
+    accepted: bool,
+    reason: Option<String>,
+    status: StatusApiResponse,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -302,6 +361,7 @@ struct StatusApiResponse {
 struct StatusApiDocument {
     id: String,
     name: String,
+    path_hash: String,
     writing_count: Option<i64>,
 }
 
@@ -374,6 +434,7 @@ fn status_api_response(
                 .and_then(|name| name.to_str())
                 .unwrap_or("unknown")
                 .to_string(),
+            path_hash: path.map(path_identity_hash).unwrap_or_default(),
             writing_count: status.document_writing_count,
         })
     } else {
@@ -401,6 +462,10 @@ fn status_api_response(
         document,
         session,
     }
+}
+
+fn path_identity_hash(path: &Path) -> String {
+    file_hash(path.to_string_lossy().as_bytes())
 }
 
 fn mtime_ms(metadata: &fs::Metadata) -> i64 {
@@ -542,6 +607,7 @@ fn reset_tracking_state(state: &AppState) -> Result<(), String> {
     watch.expected_hash = None;
     watch.pending_atomic_replace = false;
     watch.last_external_notice = None;
+    watch.editor_revisions.clear();
     drop(watch);
     state
         .core
@@ -584,7 +650,7 @@ fn refresh_status_revision(state: &AppState) -> Result<u64, String> {
     sync_status_revision(state, &status, tracking)
 }
 
-pub(crate) fn read_status_api_json(app: &AppHandle) -> Result<Vec<u8>, String> {
+fn read_status_api_response(app: &AppHandle) -> Result<StatusApiResponse, String> {
     let state = app.state::<AppState>();
     let path = tracking_path(state.inner())?;
     let tracking = path.is_some();
@@ -596,13 +662,175 @@ pub(crate) fn read_status_api_json(app: &AppHandle) -> Result<Vec<u8>, String> {
     drop(core);
 
     let revision = sync_status_revision(state.inner(), &status, tracking)?;
-    let response = status_api_response(
+    Ok(status_api_response(
         &state.service_instance_id,
         revision,
         tracking,
         path.as_deref(),
         &status,
+    ))
+}
+
+pub(crate) fn read_status_api_json(app: &AppHandle) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&read_status_api_response(app)?).map_err(|error| error.to_string())
+}
+
+pub(crate) fn track_document_api_json(
+    app: &AppHandle,
+    request: TrackApiRequest,
+) -> Result<Vec<u8>, String> {
+    let state = app.state::<AppState>();
+    let (snapshot, _) = start_tracking(request.path, WatchMode::FileDiff, state.inner(), app)?;
+    let document = snapshot_to_monitor(&snapshot);
+    let _ = app.emit(
+        "tracking-changed",
+        TrackingChangedPayload {
+            document: Some(document),
+        },
     );
+    read_status_api_json(app)
+}
+
+fn valid_editor_instance_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+pub(crate) fn ingest_live_snapshot_api_json(
+    app: &AppHandle,
+    request: LiveSnapshotApiRequest,
+) -> Result<Vec<u8>, String> {
+    if request.source != "caelorum" {
+        return Err("snapshot source must be caelorum".to_string());
+    }
+    if !valid_editor_instance_id(&request.editor_instance_id) {
+        return Err("editor_instance_id is invalid".to_string());
+    }
+    if request.content.len() > MAX_LIVE_SNAPSHOT_BYTES {
+        return Err("snapshot exceeds the 1 MiB limit".to_string());
+    }
+    let _client_timestamp_ms = request.timestamp_ms;
+    let path = canonical_markdown_path(Path::new(&request.path))?;
+    let state = app.state::<AppState>();
+    let _processing = state
+        .file_processing
+        .lock()
+        .map_err(|_| "File processing lock is poisoned".to_string())?;
+
+    let (document_id, previous, last_editor_revision) = {
+        let watch = state
+            .watch
+            .lock()
+            .map_err(|_| "Watch state lock is poisoned".to_string())?;
+        if watch.path.as_deref() != Some(path.as_path()) || watch.mode != Some(WatchMode::FileDiff)
+        {
+            return Err("tracked document does not match snapshot path".to_string());
+        }
+        let document_id = watch
+            .document_id
+            .clone()
+            .ok_or_else(|| "tracked document is unavailable".to_string())?;
+        let previous = watch
+            .last_good_snapshot
+            .clone()
+            .ok_or_else(|| "tracked snapshot baseline is unavailable".to_string())?;
+        let last_editor_revision = watch
+            .editor_revisions
+            .get(&request.editor_instance_id)
+            .copied();
+        (document_id, previous, last_editor_revision)
+    };
+
+    let next = MemorySnapshot {
+        hash: file_hash(request.content.as_bytes()),
+        size: request.content.len() as u64,
+        mtime_ms: previous.mtime_ms,
+        content: request.content,
+    };
+    let summary = match live_snapshot_decision(
+        &previous,
+        last_editor_revision,
+        request.editor_revision,
+        &next,
+    )? {
+        LiveSnapshotDecision::StaleRevision => {
+            let response = LiveSnapshotApiResponse {
+                accepted: false,
+                reason: Some("stale_editor_revision".to_string()),
+                status: read_status_api_response(app)?,
+            };
+            return serde_json::to_vec(&response).map_err(|error| error.to_string());
+        }
+        LiveSnapshotDecision::SameSnapshot => {
+            if let Ok(mut watch) = state.watch.lock() {
+                watch
+                    .editor_revisions
+                    .insert(request.editor_instance_id, request.editor_revision);
+            }
+            let response = LiveSnapshotApiResponse {
+                accepted: false,
+                reason: Some("same_snapshot".to_string()),
+                status: read_status_api_response(app)?,
+            };
+            return serde_json::to_vec(&response).map_err(|error| error.to_string());
+        }
+        LiveSnapshotDecision::Changed(summary) => summary,
+    };
+    let event = EditEvent {
+        document_id: document_id.clone(),
+        timestamp_ms: epoch_millis(),
+        source: "caelorum.snapshot".to_string(),
+        tracking_origin: "editor_snapshot".to_string(),
+        inserted_chars: summary.inserted_chars,
+        deleted_chars: summary.deleted_chars,
+        writing_inserted_units: Some(summary.writing.inserted_units),
+        writing_deleted_units: Some(summary.writing.deleted_units),
+        writing_count_version: Some(summary.writing.count_version),
+        is_user_edit: true,
+        ime_composition: false,
+        transaction_id: format!(
+            "caelorum-{}-{}",
+            request.editor_instance_id, request.editor_revision
+        ),
+        change_count: summary.change_count,
+    };
+
+    let status = {
+        let mut core = state
+            .core
+            .lock()
+            .map_err(|_| "Writing Core lock is poisoned".to_string())?;
+        core.record_edit(event).map_err(|error| error.to_string())?;
+        core.mark_live_snapshot(&next.content)
+            .map_err(|error| error.to_string())?;
+        core.status().map_err(|error| error.to_string())?
+    };
+
+    {
+        let mut watch = state
+            .watch
+            .lock()
+            .map_err(|_| "Watch state lock is poisoned".to_string())?;
+        if watch.path.as_deref() != Some(path.as_path())
+            || watch.document_id.as_deref() != Some(document_id.as_str())
+        {
+            return Err("tracked document changed during snapshot ingest".to_string());
+        }
+        watch.expected_hash = Some(next.hash.clone());
+        watch
+            .editor_revisions
+            .insert(request.editor_instance_id, request.editor_revision);
+        accept_last_good_snapshot(&mut watch, next);
+    }
+    sync_status_revision(state.inner(), &status, true)?;
+    let response = LiveSnapshotApiResponse {
+        accepted: true,
+        reason: None,
+        status: read_status_api_response(app)?,
+    };
     serde_json::to_vec(&response).map_err(|error| error.to_string())
 }
 
@@ -662,6 +890,7 @@ fn configure_watcher(
         watch.expected_hash = Some(snapshot.hash.clone());
         watch.last_good_snapshot = Some(snapshot);
         watch.last_external_notice = None;
+        watch.editor_revisions.clear();
         watch.pending_atomic_replace = false;
         watch.generation
     };
@@ -801,6 +1030,17 @@ fn process_file_snapshot(app: &AppHandle, path: &Path, generation: u64, next: Me
 
     if Some(next.hash.clone()) == last_good_hash || Some(next.hash.clone()) == expected_hash {
         let next_hash = next.hash.clone();
+        if let Ok(mut core) = state.core.lock() {
+            if let Err(error) =
+                core.mark_observed_snapshot(&next.hash, next.mtime_ms, next.size, &next.content)
+            {
+                emit_watch_error(app, path, error.to_string());
+                return;
+            }
+        } else {
+            emit_watch_error(app, path, "Writing Core lock is poisoned".to_string());
+            return;
+        }
         if let Ok(mut watch) = state.watch.lock() {
             if watch.path.as_deref() == Some(path) {
                 accept_last_good_snapshot(&mut watch, next);
@@ -1026,10 +1266,14 @@ fn snapshot_to_monitor(snapshot: &DocumentSnapshot) -> MonitorDocument {
 fn start_tracking(
     path: String,
     mode: WatchMode,
-    state: &State<'_, AppState>,
+    state: &AppState,
     app: &AppHandle,
 ) -> Result<(DocumentSnapshot, MemorySnapshot), String> {
-    reset_tracking_state(state.inner())?;
+    let _processing = state
+        .file_processing
+        .lock()
+        .map_err(|_| "File processing lock is poisoned".to_string())?;
+    reset_tracking_state(state)?;
     let snapshot = read_document(Path::new(&path))?;
     let memory = MemorySnapshot {
         content: snapshot.content.clone(),
@@ -1054,7 +1298,7 @@ fn start_tracking(
         mode,
         memory.clone(),
     )?;
-    refresh_status_revision(state.inner())?;
+    refresh_status_revision(state)?;
     Ok((snapshot, memory))
 }
 
@@ -1064,14 +1308,30 @@ fn start_monitor(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<MonitorDocument, String> {
-    let (snapshot, _) = start_tracking(path, WatchMode::FileDiff, &state, &app)?;
-    Ok(snapshot_to_monitor(&snapshot))
+    let (snapshot, _) = start_tracking(path, WatchMode::FileDiff, state.inner(), &app)?;
+    let document = snapshot_to_monitor(&snapshot);
+    let _ = app.emit(
+        "tracking-changed",
+        TrackingChangedPayload {
+            document: Some(document.clone()),
+        },
+    );
+    Ok(document)
 }
 
 #[tauri::command]
-fn stop_tracking(state: State<'_, AppState>) -> Result<(), String> {
+fn stop_tracking(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    let _processing = state
+        .file_processing
+        .lock()
+        .map_err(|_| "File processing lock is poisoned".to_string())?;
     reset_tracking_state(state.inner())?;
-    refresh_status_revision(state.inner()).map(|_| ())
+    refresh_status_revision(state.inner())?;
+    let _ = app.emit(
+        "tracking-changed",
+        TrackingChangedPayload { document: None },
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -1080,7 +1340,7 @@ fn open_document(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<DocumentSnapshot, String> {
-    let (snapshot, _) = start_tracking(path, WatchMode::EditorNotice, &state, &app)?;
+    let (snapshot, _) = start_tracking(path, WatchMode::EditorNotice, state.inner(), &app)?;
     Ok(snapshot)
 }
 
@@ -1525,6 +1785,45 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_becomes_the_shared_baseline_and_saved_hash_is_deduped() {
+        let disk = memory_snapshot(&"旧".repeat(1_000));
+        let live = memory_snapshot(&"旧".repeat(1_200));
+        let decision = live_snapshot_decision(&disk, None, 1, &live).expect("live decision");
+        let LiveSnapshotDecision::Changed(summary) = decision else {
+            panic!("live snapshot should be accepted as a change");
+        };
+        assert_eq!(summary.inserted_chars, 200);
+
+        let mut watch = WatchState {
+            last_good_hash: Some(disk.hash.clone()),
+            last_good_snapshot: Some(disk),
+            ..WatchState::default()
+        };
+        watch.expected_hash = Some(live.hash.clone());
+        accept_last_good_snapshot(&mut watch, live.clone());
+
+        assert_eq!(
+            file_diff_summary(watch.last_good_snapshot.as_ref().unwrap(), &live),
+            None,
+            "saving the already accepted live snapshot must not create a second diff"
+        );
+    }
+
+    #[test]
+    fn editor_revisions_are_deduped_per_editor_instance() {
+        let previous = memory_snapshot("正文");
+        let next = memory_snapshot("正文一");
+        assert!(matches!(
+            live_snapshot_decision(&previous, Some(7), 7, &next).unwrap(),
+            LiveSnapshotDecision::StaleRevision
+        ));
+        assert!(matches!(
+            live_snapshot_decision(&previous, None, 1, &next).unwrap(),
+            LiveSnapshotDecision::Changed(_)
+        ));
+    }
+
+    #[test]
     fn access_events_from_snapshot_reads_are_not_file_changes() {
         let access = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)));
         let create = Event::new(EventKind::Create(CreateKind::File));
@@ -1564,6 +1863,10 @@ mod tests {
         assert_eq!(json["activity_state"], "inactive");
         assert_eq!(json["document"]["id"], "doc-1");
         assert_eq!(json["document"]["name"], "mvp-smoke.md");
+        assert_eq!(
+            json["document"]["path_hash"],
+            path_identity_hash(Path::new("/private/mvp-smoke.md"))
+        );
         assert_eq!(json["document"]["writing_count"], 8471);
         assert!(json["session"].is_null());
     }

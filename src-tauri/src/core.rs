@@ -314,6 +314,16 @@ impl WritingCore {
             .update_document_state(&document.id, hash, mtime_ms, size, writing_count)
     }
 
+    pub fn mark_live_snapshot(&mut self, content: &str) -> Result<(), CoreError> {
+        let Some(document) = self.current_document.as_mut() else {
+            return Err(CoreError::NoDocument);
+        };
+        let writing_count = Some(count_writing_units(content));
+        document.writing_count = writing_count;
+        self.storage
+            .update_document_writing_count(&document.id, writing_count)
+    }
+
     pub fn record_edit(&mut self, event: EditEvent) -> Result<CoreStatus, CoreError> {
         self.record_edit_at(event, epoch_seconds())
     }
@@ -679,6 +689,24 @@ impl Storage {
                 hash,
                 mtime_ms,
                 size as i64,
+                writing_count.map(|count| count.total),
+                writing_count.map(|_| WRITING_COUNT_VERSION),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn update_document_writing_count(
+        &self,
+        document_id: &str,
+        writing_count: Option<WritingCount>,
+    ) -> Result<(), CoreError> {
+        self.conn.execute(
+            "UPDATE documents SET updated_at = ?2, current_writing_units = ?3,
+                 writing_count_version = ?4 WHERE id = ?1",
+            params![
+                document_id,
+                epoch_seconds(),
                 writing_count.map(|count| count.total),
                 writing_count.map(|_| WRITING_COUNT_VERSION),
             ],
@@ -1187,6 +1215,20 @@ mod tests {
             status.session_writing_count_version,
             Some(WRITING_COUNT_VERSION)
         );
+    }
+
+    #[test]
+    fn live_snapshot_updates_writing_count_without_replacing_the_disk_save_hash() {
+        let mut core = WritingCore::new(PathBuf::from(":memory:"), config()).expect("core");
+        let snapshot = snapshot();
+        let document_id = core.open_document(&snapshot).expect("open");
+
+        core.mark_live_snapshot("初始正文新增")
+            .expect("live snapshot");
+        let status = core.status_at(0).expect("status");
+        assert_eq!(status.document_writing_count, Some(6));
+        core.ensure_save_is_safe(&document_id, Path::new("test.md"), "hash")
+            .expect("live monitoring must not change the on-disk save baseline");
     }
 
     #[test]

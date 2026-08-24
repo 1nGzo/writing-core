@@ -1,7 +1,8 @@
 # Writing Core Status API v1
 
-This document is the stable, read-only integration contract for local
-consumers of Writing Core.
+This document describes the local v1 integration contract. Status remains a
+stable read-only view; the two loopback-only mutation routes are narrow editor
+adapter inputs owned by Writing Core.
 
 ## Endpoint
 
@@ -10,10 +11,9 @@ GET http://127.0.0.1:43180/v1/status
 ```
 
 The server is owned by the Writing Monitor Tauri process and binds only to
-`127.0.0.1`. It is not a LAN service. The endpoint has no authentication,
-CORS policy, control route, or write route. Writing Monitor may continue to
-run normally if this port is already occupied; the API is then unavailable and
-the process logs the bind failure.
+`127.0.0.1`. It is not a LAN service and has no CORS policy or authentication.
+Writing Monitor may continue to run normally if this port is already occupied;
+the API is then unavailable and the process logs the bind failure.
 
 The API is available only while Writing Monitor is running. It is not a
 systemd service and does not leave a separate server process behind.
@@ -47,6 +47,7 @@ session, the response has this shape:
   "document": {
     "id": "opaque-document-id",
     "name": "mvp-smoke.md",
+    "path_hash": "sha256-of-canonical-path",
     "writing_count": 8471
   },
   "session": null
@@ -97,6 +98,8 @@ state cannot provide it.
   current Writing Monitor process.
 - `document` is null when no Markdown document is being tracked. It contains a
   safe display name, not the absolute path or正文 text.
+- `document.path_hash` is an opaque SHA-256 identity used by trusted local
+  adapters to compare their current path without exposing the absolute path.
 - `session` is null before the first accepted real正文 change for the current
   tracked document. It contains the latest Core session while tracking,
   including a session whose state is `ended`.
@@ -145,13 +148,33 @@ The API reads a read-only Core status snapshot. It does not refresh
 polls. Core may still persist a lifecycle transition through its normal
 non-API operations.
 
+## Editor adapter routes
+
+`POST /v1/track` selects the one explicit Markdown document tracked by the
+Core. Its JSON body is `{ "path": "/absolute/canonical/document.md" }`.
+It reuses the same canonical-path validation, initial disk snapshot, document
+identity, Core state, and file watcher as Standalone Monitor selection.
+
+`POST /v1/snapshot` accepts a stable full Markdown snapshot from an editor
+adapter. Its JSON body contains `path`, `content`, fixed adapter `source`,
+`editor_instance_id`, monotonic per-instance `editor_revision`, and an optional
+client `timestamp_ms`. Core uses its own receive time for activity/session
+policy. Requests are capped at 1 MiB of content;正文 is kept only in the existing
+in-memory snapshot path and is never logged.
+
+Accepted live snapshots and later file-watch saves share the same latest
+snapshot/hash baseline. Saving the exact live content therefore updates the
+disk metadata without recording a second EditEvent. A different editor instance
+has its own revision sequence; this is identity/deduplication, not CRDT or
+collaborative merging.
+
 ## Errors and privacy
 
 Normal business states such as `tracking: false`, `document: null`, and
-`session: null` return `200 OK`. Unknown paths return `404`; non-GET methods
-return `405`; an actual status serialization failure returns `500`.
+`session: null` return `200 OK`. Unknown paths return `404`; unsupported methods
+return `405`; invalid adapter payloads return `400`/`409`/`413` as applicable.
 
-The response contains no正文 content, diff payload, inserted/deleted text,
+Status responses contain no正文 content, diff payload, inserted/deleted text,
 Markdown snapshot, absolute正文 path, SQLite access, or desktop-pet behavior.
 Consumers must use this HTTP contract and must not open the Writing Core
 SQLite database or watch the Markdown file themselves.
@@ -168,4 +191,3 @@ negotiation endpoint is implemented.
 ```bash
 curl -sS http://127.0.0.1:43180/v1/status
 ```
-

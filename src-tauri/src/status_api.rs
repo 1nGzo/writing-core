@@ -12,6 +12,14 @@ use std::{
 use tauri::AppHandle;
 
 pub const STATUS_API_PORT: u16 = 43180;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
 
 pub struct StatusApiRuntime {
     stop: Arc<AtomicBool>,
@@ -90,83 +98,123 @@ fn run_server(listener: TcpListener, app: AppHandle, stop: Arc<AtomicBool>) {
 
 fn handle_connection(stream: &mut TcpStream, app: &AppHandle) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let mut request = Vec::with_capacity(4096);
-    let mut chunk = [0_u8; 2048];
-
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => {
-                request.extend_from_slice(&chunk[..read]);
-                if request.len() >= 8192 || request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                break;
-            }
-            Err(error) => {
-                eprintln!("[STATUS API] request read failed: {error}");
-                return;
-            }
+    let request = match read_http_request(stream) {
+        Ok(request) => request,
+        Err((status, code)) => {
+            send_error(stream, status, code, None);
+            return;
         }
-    }
-
-    let request_text = String::from_utf8_lossy(&request);
-    let request_line = request_text.lines().next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let Some(method) = parts.next() else {
-        send_json(
-            stream,
-            "400 Bad Request",
-            b"{\"error\":\"bad_request\"}",
-            None,
-        );
-        return;
     };
-    let Some(raw_path) = parts.next() else {
-        send_json(
-            stream,
-            "400 Bad Request",
-            b"{\"error\":\"bad_request\"}",
-            None,
-        );
-        return;
+    let path = request.path.split('?').next().unwrap_or(&request.path);
+
+    let result = match (request.method.as_str(), path) {
+        ("GET", "/v1/status") => crate::read_status_api_json(app),
+        ("POST", "/v1/track") => serde_json::from_slice::<crate::TrackApiRequest>(&request.body)
+            .map_err(|_| "invalid track request".to_string())
+            .and_then(|payload| crate::track_document_api_json(app, payload)),
+        ("POST", "/v1/snapshot") => {
+            serde_json::from_slice::<crate::LiveSnapshotApiRequest>(&request.body)
+                .map_err(|_| "invalid snapshot request".to_string())
+                .and_then(|payload| crate::ingest_live_snapshot_api_json(app, payload))
+        }
+        ("GET" | "POST", _) => {
+            send_error(stream, "404 Not Found", "not_found", None);
+            return;
+        }
+        _ => {
+            send_error(
+                stream,
+                "405 Method Not Allowed",
+                "method_not_allowed",
+                Some("Allow: GET, POST\r\n"),
+            );
+            return;
+        }
     };
 
-    if method != "GET" {
-        send_json(
-            stream,
-            "405 Method Not Allowed",
-            b"{\"error\":\"method_not_allowed\"}",
-            Some("Allow: GET\r\n"),
-        );
-        return;
-    }
-
-    let path = raw_path.split('?').next().unwrap_or(raw_path);
-    if path != "/v1/status" {
-        send_json(stream, "404 Not Found", b"{\"error\":\"not_found\"}", None);
-        return;
-    }
-
-    match crate::read_status_api_json(app) {
+    match result {
         Ok(body) => send_json(stream, "200 OK", &body, None),
         Err(error) => {
-            eprintln!("[STATUS API] status serialization failed: {error}");
-            send_json(
-                stream,
-                "500 Internal Server Error",
-                b"{\"error\":\"status_unavailable\"}",
-                None,
-            );
+            let (status, code) = if error.contains("tracked document") {
+                ("409 Conflict", "tracked_document_mismatch")
+            } else if error.contains("limit") {
+                ("413 Payload Too Large", "snapshot_too_large")
+            } else {
+                ("400 Bad Request", "invalid_request")
+            };
+            eprintln!("[STATUS API] request rejected path={path} error={error}");
+            send_error(stream, status, code, None);
         }
     }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, (&'static str, &'static str)> {
+    let mut request = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 4096];
+    let header_end = loop {
+        if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+        if request.len() >= MAX_HEADER_BYTES {
+            return Err(("431 Request Header Fields Too Large", "headers_too_large"));
+        }
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|_| ("400 Bad Request", "bad_request"))?;
+        if read == 0 {
+            return Err(("400 Bad Request", "bad_request"));
+        }
+        request.extend_from_slice(&chunk[..read]);
+    };
+
+    let headers = std::str::from_utf8(&request[..header_end])
+        .map_err(|_| ("400 Bad Request", "bad_request"))?;
+    let mut lines = headers.split("\r\n");
+    let mut request_parts = lines.next().unwrap_or_default().split_whitespace();
+    let method = request_parts
+        .next()
+        .ok_or(("400 Bad Request", "bad_request"))?
+        .to_string();
+    let path = request_parts
+        .next()
+        .ok_or(("400 Bad Request", "bad_request"))?
+        .to_string();
+    let content_length = lines
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        return Err(("413 Payload Too Large", "payload_too_large"));
+    }
+    let expected = header_end + content_length;
+    while request.len() < expected {
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|_| ("400 Bad Request", "incomplete_body"))?;
+        if read == 0 {
+            return Err(("400 Bad Request", "incomplete_body"));
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.len() > MAX_HEADER_BYTES + MAX_BODY_BYTES {
+            return Err(("413 Payload Too Large", "payload_too_large"));
+        }
+    }
+
+    Ok(HttpRequest {
+        method,
+        path,
+        body: request[header_end..expected].to_vec(),
+    })
+}
+
+fn send_error(stream: &mut TcpStream, status: &str, code: &str, extra_headers: Option<&str>) {
+    let body = serde_json::to_vec(&serde_json::json!({ "error": code }))
+        .unwrap_or_else(|_| b"{\"error\":\"internal_error\"}".to_vec());
+    send_json(stream, status, &body, extra_headers);
 }
 
 fn send_json(stream: &mut TcpStream, status: &str, body: &[u8], extra_headers: Option<&str>) {
