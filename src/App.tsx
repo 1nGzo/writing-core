@@ -397,7 +397,10 @@ function App() {
           setSaveState(`写作统计不可用（RAW 仍记录）: ${String(error)}`);
         }
         appendDebugEvent({ ...nextEvent, preview });
-        const nextStatus = await invoke<CoreStatus>("record_edit", { event: nextEvent });
+        const nextStatus = await invoke<CoreStatus>("record_edit", {
+          event: nextEvent,
+          content: newMarkdown,
+        });
         receiveStatus("record_edit", nextStatus);
       })
       .catch((error: unknown) => {
@@ -619,9 +622,20 @@ function App() {
   }
 
   useEffect(() => {
-    void invoke<RuntimeTimingConfig>("get_runtime_config")
-      .then(setRuntimeTiming)
-      .catch((error) => setTimingError(`读取 runtime timing 失败: ${String(error)}`));
+    void Promise.all([
+      invoke<RuntimeTimingConfig>("get_runtime_config"),
+      invoke<CoreStatus>("get_core_status"),
+    ])
+      .then(([timing, nextStatus]) => {
+        setRuntimeTiming(timing);
+        receiveStatus("startup", nextStatus);
+        documentIdRef.current = nextStatus.document_id ?? null;
+        setWatchError(null);
+      })
+      .catch((error) => {
+        setTimingError(`读取 runtime timing 失败: ${String(error)}`);
+        setWatchError("Writing Core 不可用");
+      });
   }, []);
 
   useEffect(() => {
@@ -713,16 +727,17 @@ function App() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      if (!documentIdRef.current) return;
       void Promise.all([
         invoke<CoreStatus>("get_core_status"),
         invoke<WatchDiagnostics>("get_watch_diagnostics"),
       ])
         .then(([nextStatus, nextDiagnostics]) => {
           receiveStatus("poll", nextStatus);
+          documentIdRef.current = nextStatus.document_id ?? null;
           setWatchDiagnostics(nextDiagnostics);
+          setWatchError(null);
         })
-        .catch(() => undefined);
+        .catch(() => setWatchError("Writing Core 不可用；正在自动重连"));
     }, 1000);
     return () => window.clearInterval(timer);
   }, []);

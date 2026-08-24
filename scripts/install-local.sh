@@ -4,11 +4,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 SOURCE_BINARY="$PROJECT_DIR/src-tauri/target/release/caelorum-writing-spike"
+CORE_SOURCE_BINARY="$PROJECT_DIR/src-tauri/target/release/caelorum-writing-core"
 INSTALL_DIR="$HOME/.local/lib/caelorum-writing-monitor"
 INSTALL_BINARY="$INSTALL_DIR/caelorum-writing-spike"
+CORE_INSTALL_DIR="$HOME/.local/lib/caelorum-writing-core"
+CORE_INSTALL_BINARY="$CORE_INSTALL_DIR/caelorum-writing-core"
 BIN_DIR="$HOME/.local/bin"
 LAUNCHER="$BIN_DIR/writing-monitor"
 LAUNCHER_TEMPLATE="$PROJECT_DIR/scripts/writing-monitor.launcher"
+UNIT_SOURCE="$PROJECT_DIR/systemd/caelorum-writing-core.service"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+UNIT_PATH="$UNIT_DIR/caelorum-writing-core.service"
 
 if [[ ! -f "$SOURCE_BINARY" || ! -x "$SOURCE_BINARY" ]]; then
   printf '%s\n' 'Writing Monitor release executable not found.' >&2
@@ -18,8 +24,21 @@ if [[ ! -f "$SOURCE_BINARY" || ! -x "$SOURCE_BINARY" ]]; then
   exit 1
 fi
 
+if [[ ! -f "$CORE_SOURCE_BINARY" || ! -x "$CORE_SOURCE_BINARY" ]]; then
+  printf '%s\n' 'Headless Writing Core release executable not found.' >&2
+  printf 'Expected: %s\n' "$CORE_SOURCE_BINARY" >&2
+  printf '%s\n' 'Build it with:' >&2
+  printf '  cargo build --release --manifest-path %s --bin caelorum-writing-core\n' "$PROJECT_DIR/src-tauri/Cargo.toml" >&2
+  exit 1
+fi
+
 if [[ ! -f "$LAUNCHER_TEMPLATE" ]]; then
   printf 'Launcher template not found: %s\n' "$LAUNCHER_TEMPLATE" >&2
+  exit 1
+fi
+
+if [[ ! -f "$UNIT_SOURCE" ]]; then
+  printf 'Systemd user unit not found: %s\n' "$UNIT_SOURCE" >&2
   exit 1
 fi
 
@@ -43,11 +62,18 @@ if [[ -f "$LAUNCHER" ]] && ! grep -qF '# caelorum-writing-monitor launcher' "$LA
   exit 1
 fi
 
-mkdir -p "$INSTALL_DIR" "$BIN_DIR"
+mkdir -p "$INSTALL_DIR" "$CORE_INSTALL_DIR" "$BIN_DIR" "$UNIT_DIR"
 install -m 0755 "$SOURCE_BINARY" "$INSTALL_BINARY"
+install -m 0755 "$CORE_SOURCE_BINARY" "$CORE_INSTALL_BINARY"
 install -m 0755 "$LAUNCHER_TEMPLATE" "$LAUNCHER"
+install -m 0644 "$UNIT_SOURCE" "$UNIT_PATH"
+systemctl --user daemon-reload
+systemctl --user enable caelorum-writing-core.service
+systemctl --user restart caelorum-writing-core.service
 
-printf '%s\n' 'Installed Writing Monitor.'
+printf '%s\n' 'Installed Headless Writing Core and optional Writing Monitor client.'
+printf 'Core binary: %s\n' "$CORE_INSTALL_BINARY"
+printf 'Core unit: %s\n' "$UNIT_PATH"
 printf 'Binary: %s\n' "$INSTALL_BINARY"
 printf 'Command: %s\n' "$LAUNCHER"
 if [[ ":${PATH}:" == *":$BIN_DIR:"* ]]; then

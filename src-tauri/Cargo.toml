@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "MVP-0 vertical slice for the Writing Core"
 authors = ["you"]
 edition = "2021"
+default-run = "caelorum-writing-spike"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

@@ -36,7 +36,7 @@ pub struct CoreConfig {
     source: &'static str,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct RuntimeTimingConfig {
     pub idle_threshold_seconds: i64,

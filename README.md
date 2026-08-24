@@ -1,6 +1,15 @@
-# Writing Core MVP-0.6 写作字数统计验证
+# Caelorum Writing Core
 
-这是《苍穹之诗》码字器的独立 spike，不是正式产品目录。本轮把 MVP-0 从“编辑器驱动”调整为：
+Writing Core 现在是独立常驻的 headless runtime；Tauri Writing Monitor 是可选 GUI client，Caelorum「创作」通过 Browser 后端代理消费同一个 Core。正文统计、SQLite、file watcher、session/idle policy 与 live snapshot/dedupe 都只存在于这一套 Rust runtime 中。
+
+```text
+caelorum-writing-core (systemd user service, 127.0.0.1:43180)
+├── Caelorum Creation
+├── Standalone Writing Monitor client
+└── future Tiru consumer
+```
+
+核心数据流仍是：
 
 ```text
 普通 Markdown 文件
@@ -18,20 +27,29 @@ Markdown → prose → WRITING token diff
 Rust Writing Core / SQLite
 ```
 
-CodeMirror 仍然保留为可选的精确事件测试客户端：
+Standalone 中的 CodeMirror 仍是可选 client；它把完整 snapshot 发送给 headless Core，不拥有第二个 Core、watcher 或 SQLite：
 
 ```text
-CodeMirror transaction → editor_transaction EditEvent → Writing Core
+CodeMirror transaction → POST /v1/snapshot → Headless Writing Core
 ```
 
 正文唯一真源仍然是 `.md` 文件。SQLite 只保存文档元数据、session、统计和事件 metadata，不保存正文全文；File Watch 的 previous snapshot 只存在进程内存。
 
 ## Daily Use
 
-安装或更新本地 release executable：
+先构建两个正式 executable，再安装：
 
 ```bash
+npm run tauri build
+cargo build --release --manifest-path src-tauri/Cargo.toml --bin caelorum-writing-core
 ./scripts/install-local.sh
+```
+
+安装脚本会安装并启用 `caelorum-writing-core.service`。登录后 Core 自动启动；不需要先打开 GUI：
+
+```bash
+systemctl --user status caelorum-writing-core.service
+curl -sS http://127.0.0.1:43180/v1/status
 ```
 
 日常启动命令固定为：
@@ -40,7 +58,7 @@ CodeMirror transaction → editor_transaction EditEvent → Writing Core
 writing-monitor
 ```
 
-它可以从任意当前目录执行，直接启动已安装的 Tauri release executable，并只为 Writing Monitor 进程设置 `GDK_BACKEND=x11`。默认命令启动后立即返回终端；排错时可使用：
+它可以从任意当前目录执行，启动已安装的可选 Tauri client，并连接现有 Headless Core。关闭 GUI 不会停止 Core。默认命令启动后立即返回终端；排错时可使用：
 
 ```bash
 writing-monitor --foreground
@@ -50,7 +68,9 @@ writing-monitor --foreground
 
 ## 当前能力
 
-- Writing Monitor 默认入口：选择一个 `.md` / `.markdown` 文件并开始监控
+- Headless Core 由 systemd user service 独立持有生命周期并只监听 `127.0.0.1:43180`
+- tracked document 路径保存在 Core data dir 的 `tracked-document.json`；Core 重启时尽量恢复，文件失效时安全跳过
+- Writing Monitor 默认入口：作为 client 选择一个 `.md` / `.markdown` 文件并调用 `/v1/track`
 - 监听目标文件所在父目录，支持普通保存和 atomic replace 后的目标路径恢复
 - 300ms debounce；只有文件系统事件触发后才重新读取、hash 和 diff
 - `similar 3.1.2` character diff，统计单位是 Rust `char` / Unicode scalar
@@ -59,7 +79,7 @@ writing-monitor --foreground
 - 标题和链接/image alt 的语义文字计入；链接 URL 与图片路径不计
 - 当前文档 Writing Count 在打开、真实保存和 File Diff accepted snapshot 后从当前 Markdown 重算，SQLite 不保存正文
 - File Watch 事件使用 `source = file.diff`、`tracking_origin = file_diff`
-- CodeMirror 事件使用 `tracking_origin = editor_transaction`，保留 typing、paste、cut、undo、redo、IME 标记和安全保存
+- Creation / CodeMirror live snapshot 使用共享 snapshot/dedupe 路径；保存相同内容不重复计数
 - baseline 不产生写作事件；same hash 不产生事件
 - session 分开统计：`session_span_seconds`、`session_active_seconds`、`session_idle_seconds`、`since_last_edit_seconds`
 - 默认 idle threshold 为 300 秒；session end threshold 为 3600 秒
@@ -70,13 +90,13 @@ writing-monitor --foreground
 
 ## Development
 
-开发启动仍使用：
+GUI 开发启动仍使用：
 
 ```bash
 npm run tauri dev
 ```
 
-日常使用不需要启动 Vite、Node、Cargo 或 Tauri dev server。
+Headless 开发运行可使用 `cargo run --manifest-path src-tauri/Cargo.toml --bin caelorum-writing-core`。日常使用不需要启动 Vite、Node、Cargo 或 Tauri dev server。
 
 当前验证机没有系统级 WebKitGTK 4.1 / rsvg2 开发包，之前验证使用了 `/tmp/caelorum-writing-sysroot` 临时用户态 sysroot。先在终端加载 Rust：
 

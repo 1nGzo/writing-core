@@ -10,13 +10,11 @@ adapter inputs owned by Writing Core.
 GET http://127.0.0.1:43180/v1/status
 ```
 
-The server is owned by the Writing Monitor Tauri process and binds only to
-`127.0.0.1`. It is not a LAN service and has no CORS policy or authentication.
-Writing Monitor may continue to run normally if this port is already occupied;
-the API is then unavailable and the process logs the bind failure.
-
-The API is available only while Writing Monitor is running. It is not a
-systemd service and does not leave a separate server process behind.
+The server is owned by the `caelorum-writing-core` headless binary and binds
+only to `127.0.0.1`. It is not a LAN service and has no CORS policy or
+authentication. The binary runs as the enabled user service
+`caelorum-writing-core.service`; Standalone Monitor is an optional client and
+never binds this port or opens a second Writing Core database.
 
 ## Response schema
 
@@ -95,7 +93,8 @@ state cannot provide it.
   starts. It remains unchanged for that process lifetime and changes after a
   full process restart. It is not a PID.
 - `tracking` is true only while a Markdown path is actively configured in the
-  current Writing Monitor process.
+  current Headless Core process. The selected path is persisted outside SQLite
+  so a service restart can restore tracking when the file is still available.
 - `document` is null when no Markdown document is being tracked. It contains a
   safe display name, not the absolute path or正文 text.
 - `document.path_hash` is an opaque SHA-256 identity used by trusted local
@@ -155,6 +154,10 @@ Core. Its JSON body is `{ "path": "/absolute/canonical/document.md" }`.
 It reuses the same canonical-path validation, initial disk snapshot, document
 identity, Core state, and file watcher as Standalone Monitor selection.
 
+`POST /v1/untrack` clears the current tracked document and its persisted
+selection. It has no request body and does not delete正文 or historical SQLite
+records.
+
 `POST /v1/snapshot` accepts a stable full Markdown snapshot from an editor
 adapter. Its JSON body contains `path`, `content`, fixed adapter `source`,
 `editor_instance_id`, monotonic per-instance `editor_revision`, and an optional
@@ -167,6 +170,13 @@ snapshot/hash baseline. Saving the exact live content therefore updates the
 disk metadata without recording a second EditEvent. A different editor instance
 has its own revision sequence; this is identity/deduplication, not CRDT or
 collaborative merging.
+
+`GET /v1/runtime-config` returns the Core-owned idle/session-end thresholds for
+trusted local UI clients. It does not expose正文 or mutable state.
+
+Debug builds also accept `POST /v1/debug-timing` from the Standalone client;
+release Headless Core builds reject it. Production defaults and environment
+configuration remain Core-owned.
 
 ## Errors and privacy
 

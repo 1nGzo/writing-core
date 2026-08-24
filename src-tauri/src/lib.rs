@@ -1,4 +1,5 @@
 mod core;
+mod core_client;
 mod diff;
 mod status_api;
 mod writing;
@@ -9,7 +10,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -26,7 +27,7 @@ use notify::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use status_api::StatusApiRuntime;
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri::{AppHandle, Manager, RunEvent, State};
 use uuid::Uuid;
 use writing::{writing_delta, WritingDelta};
 
@@ -35,14 +36,32 @@ const FILE_DIFF_DEBOUNCE: Duration = Duration::from_millis(300);
 const FILE_RETRY_DELAY: Duration = Duration::from_millis(150);
 const MAX_LIVE_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
-struct AppState {
+pub(crate) struct AppState {
     core: Mutex<WritingCore>,
     watcher: Mutex<Option<RecommendedWatcher>>,
     watch: Mutex<WatchState>,
     file_processing: Mutex<()>,
     service_instance_id: String,
     revision: Mutex<RevisionTracker>,
-    status_api: Mutex<Option<StatusApiRuntime>>,
+    tracking_state_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ClientDocumentState {
+    document_id: String,
+    path: PathBuf,
+    hash: String,
+}
+
+struct ClientState {
+    document: Mutex<Option<ClientDocumentState>>,
+    editor_instance_id: String,
+    editor_revision: Mutex<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersistedTrackingState {
+    path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,19 +250,13 @@ struct MonitorDocument {
     size: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-struct TrackingChangedPayload {
-    document: Option<MonitorDocument>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct TrackApiRequest {
     path: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct LiveSnapshotApiRequest {
     path: String,
@@ -255,33 +268,19 @@ pub(crate) struct LiveSnapshotApiRequest {
     timestamp_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct DebugTimingApiRequest {
+    idle_threshold_seconds: i64,
+    session_end_threshold_seconds: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct LiveSnapshotApiResponse {
     accepted: bool,
     reason: Option<String>,
     status: StatusApiResponse,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-struct ExternalModification {
-    path: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-struct FileDiffPayload {
-    path: String,
-    event: EditEvent,
-    status: CoreStatus,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-struct WatchErrorPayload {
-    path: String,
-    message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -344,7 +343,7 @@ struct WatchDiagnostics {
     pending_atomic_replace: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct StatusApiResponse {
     schema_version: u8,
@@ -356,7 +355,7 @@ struct StatusApiResponse {
     session: Option<StatusApiSession>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct StatusApiDocument {
     id: String,
@@ -365,7 +364,7 @@ struct StatusApiDocument {
     writing_count: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct StatusApiSession {
     id: String,
@@ -650,9 +649,8 @@ fn refresh_status_revision(state: &AppState) -> Result<u64, String> {
     sync_status_revision(state, &status, tracking)
 }
 
-fn read_status_api_response(app: &AppHandle) -> Result<StatusApiResponse, String> {
-    let state = app.state::<AppState>();
-    let path = tracking_path(state.inner())?;
+fn read_status_api_response(state: &AppState) -> Result<StatusApiResponse, String> {
+    let path = tracking_path(state)?;
     let tracking = path.is_some();
     let mut core = state
         .core
@@ -661,7 +659,7 @@ fn read_status_api_response(app: &AppHandle) -> Result<StatusApiResponse, String
     let status = core.status_read_only().map_err(|error| error.to_string())?;
     drop(core);
 
-    let revision = sync_status_revision(state.inner(), &status, tracking)?;
+    let revision = sync_status_revision(state, &status, tracking)?;
     Ok(status_api_response(
         &state.service_instance_id,
         revision,
@@ -671,24 +669,107 @@ fn read_status_api_response(app: &AppHandle) -> Result<StatusApiResponse, String
     ))
 }
 
-pub(crate) fn read_status_api_json(app: &AppHandle) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(&read_status_api_response(app)?).map_err(|error| error.to_string())
+pub(crate) fn read_status_api_json(state: &AppState) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&read_status_api_response(state)?).map_err(|error| error.to_string())
+}
+
+pub(crate) fn read_runtime_config_api_json(state: &AppState) -> Result<Vec<u8>, String> {
+    let core = state
+        .core
+        .lock()
+        .map_err(|_| "Writing Core lock is poisoned".to_string())?;
+    serde_json::to_vec(&core.runtime_timing()).map_err(|error| error.to_string())
+}
+
+pub(crate) fn apply_debug_timing_api_json(
+    state: &AppState,
+    request: DebugTimingApiRequest,
+) -> Result<Vec<u8>, String> {
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (state, request);
+        Err("Debug timing overrides are unavailable in release builds".to_string())
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let mut core = state
+            .core
+            .lock()
+            .map_err(|_| "Writing Core lock is poisoned".to_string())?;
+        let config = core
+            .apply_debug_timing(
+                request.idle_threshold_seconds,
+                request.session_end_threshold_seconds,
+            )
+            .map_err(|error| error.to_string())?;
+        serde_json::to_vec(&config).map_err(|error| error.to_string())
+    }
 }
 
 pub(crate) fn track_document_api_json(
-    app: &AppHandle,
+    state: &Arc<AppState>,
     request: TrackApiRequest,
 ) -> Result<Vec<u8>, String> {
-    let state = app.state::<AppState>();
-    let (snapshot, _) = start_tracking(request.path, WatchMode::FileDiff, state.inner(), app)?;
-    let document = snapshot_to_monitor(&snapshot);
-    let _ = app.emit(
-        "tracking-changed",
-        TrackingChangedPayload {
-            document: Some(document),
-        },
-    );
-    read_status_api_json(app)
+    let (snapshot, _) = start_tracking(request.path, WatchMode::FileDiff, state)?;
+    persist_tracking_state(state, Path::new(&snapshot.path))?;
+    read_status_api_json(state)
+}
+
+pub(crate) fn stop_tracking_api_json(state: &AppState) -> Result<Vec<u8>, String> {
+    let _processing = state
+        .file_processing
+        .lock()
+        .map_err(|_| "File processing lock is poisoned".to_string())?;
+    reset_tracking_state(state)?;
+    refresh_status_revision(state)?;
+    match fs::remove_file(&state.tracking_state_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Cannot clear tracked document state: {error}")),
+    }
+    read_status_api_json(state)
+}
+
+fn persist_tracking_state(state: &AppState, path: &Path) -> Result<(), String> {
+    if let Some(parent) = state.tracking_state_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Cannot create Writing Core data directory: {error}"))?;
+    }
+    let temporary_path = state.tracking_state_path.with_extension("json.tmp");
+    let body = serde_json::to_vec(&PersistedTrackingState {
+        path: path.to_string_lossy().to_string(),
+    })
+    .map_err(|error| format!("Cannot encode tracked document state: {error}"))?;
+    fs::write(&temporary_path, body)
+        .map_err(|error| format!("Cannot write tracked document state: {error}"))?;
+    fs::rename(&temporary_path, &state.tracking_state_path)
+        .map_err(|error| format!("Cannot install tracked document state: {error}"))
+}
+
+fn restore_tracking_state(state: &Arc<AppState>) {
+    let body = match fs::read(&state.tracking_state_path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!("[CORE] cannot read tracked document state: {error}");
+            return;
+        }
+    };
+    let persisted = match serde_json::from_slice::<PersistedTrackingState>(&body) {
+        Ok(persisted) => persisted,
+        Err(error) => {
+            eprintln!("[CORE] invalid tracked document state: {error}");
+            return;
+        }
+    };
+    match start_tracking(persisted.path, WatchMode::FileDiff, state) {
+        Ok((snapshot, _)) => eprintln!(
+            "[CORE] restored tracked document path={} document_id={}",
+            snapshot.path, snapshot.document_id
+        ),
+        Err(error) => eprintln!("[CORE] tracked document restore skipped: {error}"),
+    }
 }
 
 fn valid_editor_instance_id(value: &str) -> bool {
@@ -700,11 +781,11 @@ fn valid_editor_instance_id(value: &str) -> bool {
 }
 
 pub(crate) fn ingest_live_snapshot_api_json(
-    app: &AppHandle,
+    state: &AppState,
     request: LiveSnapshotApiRequest,
 ) -> Result<Vec<u8>, String> {
-    if request.source != "caelorum" {
-        return Err("snapshot source must be caelorum".to_string());
+    if !matches!(request.source.as_str(), "caelorum" | "standalone") {
+        return Err("snapshot source must be caelorum or standalone".to_string());
     }
     if !valid_editor_instance_id(&request.editor_instance_id) {
         return Err("editor_instance_id is invalid".to_string());
@@ -714,7 +795,6 @@ pub(crate) fn ingest_live_snapshot_api_json(
     }
     let _client_timestamp_ms = request.timestamp_ms;
     let path = canonical_markdown_path(Path::new(&request.path))?;
-    let state = app.state::<AppState>();
     let _processing = state
         .file_processing
         .lock()
@@ -760,7 +840,7 @@ pub(crate) fn ingest_live_snapshot_api_json(
             let response = LiveSnapshotApiResponse {
                 accepted: false,
                 reason: Some("stale_editor_revision".to_string()),
-                status: read_status_api_response(app)?,
+                status: read_status_api_response(state)?,
             };
             return serde_json::to_vec(&response).map_err(|error| error.to_string());
         }
@@ -773,7 +853,7 @@ pub(crate) fn ingest_live_snapshot_api_json(
             let response = LiveSnapshotApiResponse {
                 accepted: false,
                 reason: Some("same_snapshot".to_string()),
-                status: read_status_api_response(app)?,
+                status: read_status_api_response(state)?,
             };
             return serde_json::to_vec(&response).map_err(|error| error.to_string());
         }
@@ -782,7 +862,7 @@ pub(crate) fn ingest_live_snapshot_api_json(
     let event = EditEvent {
         document_id: document_id.clone(),
         timestamp_ms: epoch_millis(),
-        source: "caelorum.snapshot".to_string(),
+        source: format!("{}.snapshot", request.source),
         tracking_origin: "editor_snapshot".to_string(),
         inserted_chars: summary.inserted_chars,
         deleted_chars: summary.deleted_chars,
@@ -825,31 +905,17 @@ pub(crate) fn ingest_live_snapshot_api_json(
             .insert(request.editor_instance_id, request.editor_revision);
         accept_last_good_snapshot(&mut watch, next);
     }
-    sync_status_revision(state.inner(), &status, true)?;
+    sync_status_revision(state, &status, true)?;
     let response = LiveSnapshotApiResponse {
         accepted: true,
         reason: None,
-        status: read_status_api_response(app)?,
+        status: read_status_api_response(state)?,
     };
     serde_json::to_vec(&response).map_err(|error| error.to_string())
 }
 
-fn shutdown_status_api(app: &AppHandle) {
-    let Some(state) = app.try_state::<AppState>() else {
-        return;
-    };
-    let Ok(mut runtime) = state.status_api.lock() else {
-        eprintln!("[STATUS API] shutdown skipped: status API lock is poisoned");
-        return;
-    };
-    if let Some(mut runtime) = runtime.take() {
-        runtime.shutdown();
-        eprintln!("[STATUS API] stopped");
-    }
-}
-
 fn configure_watcher(
-    app: &AppHandle,
+    state: &Arc<AppState>,
     path: &Path,
     document_id: &str,
     mode: WatchMode,
@@ -860,12 +926,12 @@ fn configure_watcher(
         .ok_or_else(|| "Markdown path has no parent directory".to_string())?
         .to_path_buf();
     let watched_path = path.to_path_buf();
-    let callback_app = app.clone();
+    let callback_state = Arc::clone(state);
 
     let mut watcher = RecommendedWatcher::new(
         move |result| {
             if let Ok(event) = result {
-                handle_file_event(&callback_app, &watched_path, event);
+                handle_file_event(&callback_state, &watched_path, event);
             }
         },
         NotifyConfig::default(),
@@ -876,7 +942,6 @@ fn configure_watcher(
         .watch(&parent, RecursiveMode::NonRecursive)
         .map_err(|error| format!("Cannot watch Markdown directory: {error}"))?;
 
-    let state = app.state::<AppState>();
     let generation = {
         let mut watch = state
             .watch
@@ -916,13 +981,12 @@ fn is_processable_file_event(event: &Event) -> bool {
     !matches!(event.kind, EventKind::Access(_))
 }
 
-fn handle_file_event(app: &AppHandle, path: &Path, event: Event) {
+fn handle_file_event(state: &Arc<AppState>, path: &Path, event: Event) {
     if !event_targets_path(&event, path) || !is_processable_file_event(&event) {
         return;
     }
     debug_watch_raw_event(path, &event);
 
-    let state = app.state::<AppState>();
     let target_may_be_replaced = target_may_be_replaced(&event);
     let generation = {
         let Ok(mut watch) = state.watch.lock() else {
@@ -941,24 +1005,24 @@ fn handle_file_event(app: &AppHandle, path: &Path, event: Event) {
         watch.generation = watch.generation.wrapping_add(1);
         watch.generation
     };
-    let callback_app = app.clone();
+    let callback_state = Arc::clone(state);
     let watched_path = path.to_path_buf();
     thread::spawn(move || {
         thread::sleep(FILE_DIFF_DEBOUNCE);
         for _ in 0..8 {
-            if !is_current_generation(&callback_app, &watched_path, generation) {
+            if !is_current_generation(&callback_state, &watched_path, generation) {
                 return;
             }
             match read_memory_snapshot(&watched_path) {
                 Ok(snapshot) => {
-                    process_file_snapshot(&callback_app, &watched_path, generation, snapshot);
+                    process_file_snapshot(&callback_state, &watched_path, generation, snapshot);
                     return;
                 }
                 Err(error) if error.contains("No such file") => {
                     thread::sleep(FILE_RETRY_DELAY);
                 }
                 Err(error) => {
-                    emit_watch_error(&callback_app, &watched_path, error);
+                    emit_watch_error(&watched_path, error);
                     return;
                 }
             }
@@ -990,16 +1054,14 @@ fn debug_watch_raw_event(path: &Path, event: &Event) {
 #[cfg(not(debug_assertions))]
 fn debug_watch_raw_event(_path: &Path, _event: &Event) {}
 
-fn is_current_generation(app: &AppHandle, path: &Path, generation: u64) -> bool {
-    let state = app.state::<AppState>();
+fn is_current_generation(state: &AppState, path: &Path, generation: u64) -> bool {
     let Ok(watch) = state.watch.lock() else {
         return false;
     };
     watch.path.as_deref() == Some(path) && watch.generation == generation
 }
 
-fn process_file_snapshot(app: &AppHandle, path: &Path, generation: u64, next: MemorySnapshot) {
-    let state = app.state::<AppState>();
+fn process_file_snapshot(state: &AppState, path: &Path, generation: u64, next: MemorySnapshot) {
     let Ok(_processing) = state.file_processing.lock() else {
         return;
     };
@@ -1034,11 +1096,11 @@ fn process_file_snapshot(app: &AppHandle, path: &Path, generation: u64, next: Me
             if let Err(error) =
                 core.mark_observed_snapshot(&next.hash, next.mtime_ms, next.size, &next.content)
             {
-                emit_watch_error(app, path, error.to_string());
+                emit_watch_error(path, error.to_string());
                 return;
             }
         } else {
-            emit_watch_error(app, path, "Writing Core lock is poisoned".to_string());
+            emit_watch_error(path, "Writing Core lock is poisoned".to_string());
             return;
         }
         if let Ok(mut watch) = state.watch.lock() {
@@ -1070,11 +1132,9 @@ fn process_file_snapshot(app: &AppHandle, path: &Path, generation: u64, next: Me
             })
             .unwrap_or(false);
         if should_emit {
-            let _ = app.emit(
-                "external-modification",
-                ExternalModification {
-                    path: path.to_string_lossy().to_string(),
-                },
+            eprintln!(
+                "[WATCH] external modification path={}",
+                path.to_string_lossy()
             );
         }
         return;
@@ -1107,23 +1167,23 @@ fn process_file_snapshot(app: &AppHandle, path: &Path, generation: u64, next: Me
 
     let status = {
         let Ok(mut core) = state.core.lock() else {
-            emit_watch_error(app, path, "Writing Core lock is poisoned".to_string());
+            emit_watch_error(path, "Writing Core lock is poisoned".to_string());
             return;
         };
         if let Err(error) = core.record_edit(event.clone()) {
-            emit_watch_error(app, path, error.to_string());
+            emit_watch_error(path, error.to_string());
             return;
         }
         if let Err(error) =
             core.mark_observed_snapshot(&next.hash, next.mtime_ms, next.size, &next.content)
         {
-            emit_watch_error(app, path, error.to_string());
+            emit_watch_error(path, error.to_string());
             return;
         }
         match core.status() {
             Ok(status) => status,
             Err(error) => {
-                emit_watch_error(app, path, error.to_string());
+                emit_watch_error(path, error.to_string());
                 return;
             }
         }
@@ -1137,28 +1197,23 @@ fn process_file_snapshot(app: &AppHandle, path: &Path, generation: u64, next: Me
             accept_last_good_snapshot(&mut watch, next);
         }
     }
-    if let Err(error) = sync_status_revision(state.inner(), &status, true) {
+    if let Err(error) = sync_status_revision(state, &status, true) {
         eprintln!("[STATUS API] revision update failed after file diff: {error}");
     }
     debug_tauri_status("file-diff-event", &status);
     debug_tauri_event("file-diff-event", &event);
-    let _ = app.emit(
-        "file-diff-event",
-        FileDiffPayload {
-            path: path.to_string_lossy().to_string(),
-            event,
-            status,
-        },
+    eprintln!(
+        "[WATCH] file diff accepted path={} event_id={}",
+        path.to_string_lossy(),
+        event.transaction_id
     );
 }
 
-fn emit_watch_error(app: &AppHandle, path: &Path, message: String) {
-    let _ = app.emit(
-        "file-watch-error",
-        WatchErrorPayload {
-            path: path.to_string_lossy().to_string(),
-            message,
-        },
+fn emit_watch_error(path: &Path, message: String) {
+    eprintln!(
+        "[WATCH] error path={} message={}",
+        path.to_string_lossy(),
+        message
     );
 }
 
@@ -1212,8 +1267,8 @@ fn debug_runtime_config(source: &str, config: &RuntimeTimingConfig) {
 fn debug_runtime_config(_source: &str, _config: &RuntimeTimingConfig) {}
 
 #[tauri::command]
-fn get_watch_diagnostics(state: State<'_, AppState>) -> WatchDiagnostics {
-    let Ok(watch) = state.watch.lock() else {
+fn get_watch_diagnostics(state: State<'_, ClientState>) -> WatchDiagnostics {
+    let Ok(document) = state.document.lock() else {
         return WatchDiagnostics {
             path: None,
             document_id: None,
@@ -1224,7 +1279,7 @@ fn get_watch_diagnostics(state: State<'_, AppState>) -> WatchDiagnostics {
             pending_atomic_replace: false,
         };
     };
-    let path = watch.path.clone();
+    let path = document.as_ref().map(|document| document.path.clone());
     let current_file_chars = path.as_deref().and_then(|path| {
         read_memory_snapshot(path)
             .ok()
@@ -1232,24 +1287,21 @@ fn get_watch_diagnostics(state: State<'_, AppState>) -> WatchDiagnostics {
     });
     WatchDiagnostics {
         path: path.as_ref().map(|path| path.to_string_lossy().to_string()),
-        document_id: watch.document_id.clone(),
-        baseline_chars: watch
-            .last_good_snapshot
+        document_id: document
             .as_ref()
-            .map(|snapshot| snapshot.content.chars().count()),
+            .map(|document| document.document_id.clone()),
+        baseline_chars: None,
         current_file_chars,
-        last_good_hash_prefix: watch
-            .last_good_hash
-            .as_deref()
+        last_good_hash_prefix: document
+            .as_ref()
+            .map(|document| document.hash.as_str())
             .map(|hash| hash[..hash.len().min(12)].to_string()),
-        watcher_state: if watch.path.is_none() {
+        watcher_state: if document.is_none() {
             "stopped".to_string()
-        } else if watch.pending_atomic_replace {
-            "pending_atomic_replace".to_string()
         } else {
-            "watching".to_string()
+            "headless_core".to_string()
         },
-        pending_atomic_replace: watch.pending_atomic_replace,
+        pending_atomic_replace: false,
     }
 }
 
@@ -1263,11 +1315,99 @@ fn snapshot_to_monitor(snapshot: &DocumentSnapshot) -> MonitorDocument {
     }
 }
 
+fn status_api_to_core(response: StatusApiResponse) -> CoreStatus {
+    let document_id = response
+        .document
+        .as_ref()
+        .map(|document| document.id.clone());
+    let document_writing_count = response
+        .document
+        .as_ref()
+        .and_then(|document| document.writing_count);
+    let session_id = response.session.as_ref().map(|session| session.id.clone());
+    CoreStatus {
+        document_id,
+        session_id,
+        session_started_at: None,
+        state: if response.activity_state == "inactive" {
+            "waiting".to_string()
+        } else {
+            response.activity_state
+        },
+        since_last_edit_seconds: response
+            .session
+            .as_ref()
+            .map(|session| session.since_last_edit_seconds)
+            .unwrap_or_default(),
+        session_span_seconds: response
+            .session
+            .as_ref()
+            .map(|session| session.span_seconds)
+            .unwrap_or_default(),
+        session_active_seconds: response
+            .session
+            .as_ref()
+            .map(|session| session.active_seconds)
+            .unwrap_or_default(),
+        session_idle_seconds: response
+            .session
+            .as_ref()
+            .map(|session| session.idle_seconds)
+            .unwrap_or_default(),
+        session_inserted_chars: 0,
+        session_deleted_chars: 0,
+        session_net_chars: 0,
+        session_writing_inserted_units: response
+            .session
+            .as_ref()
+            .and_then(|session| session.writing_inserted_units),
+        session_writing_deleted_units: response
+            .session
+            .as_ref()
+            .and_then(|session| session.writing_deleted_units),
+        session_writing_net_units: response
+            .session
+            .as_ref()
+            .and_then(|session| session.writing_net_units),
+        session_writing_count_version: Some(1),
+        document_writing_count,
+        tracking_origin: None,
+    }
+}
+
+fn client_track(path: &str, state: &ClientState) -> Result<DocumentSnapshot, String> {
+    let snapshot = read_document(Path::new(path))?;
+    let response: StatusApiResponse = core_client::request_json(
+        "POST",
+        "/v1/track",
+        Some(&TrackApiRequest {
+            path: snapshot.path.clone(),
+        }),
+    )?;
+    let document_id = response
+        .document
+        .as_ref()
+        .map(|document| document.id.clone())
+        .ok_or_else(|| "Writing Core did not return a tracked document".to_string())?;
+    let client_document = ClientDocumentState {
+        document_id: document_id.clone(),
+        path: PathBuf::from(&snapshot.path),
+        hash: snapshot.hash.clone(),
+    };
+    *state
+        .document
+        .lock()
+        .map_err(|_| "Standalone client state lock is poisoned".to_string())? =
+        Some(client_document);
+    let mut snapshot = snapshot;
+    snapshot.document_id = document_id;
+    Ok(snapshot)
+}
+
 fn start_tracking(
     path: String,
     mode: WatchMode,
-    state: &AppState,
-    app: &AppHandle,
+    state: &Arc<AppState>,
 ) -> Result<(DocumentSnapshot, MemorySnapshot), String> {
     let _processing = state
         .file_processing
@@ -1292,7 +1432,7 @@ fn start_tracking(
     let mut snapshot = snapshot;
     snapshot.document_id = document_id.clone();
     configure_watcher(
-        app,
+        state,
         Path::new(&snapshot.path),
         &document_id,
         mode,
@@ -1303,45 +1443,27 @@ fn start_tracking(
 }
 
 #[tauri::command]
-fn start_monitor(
-    path: String,
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> Result<MonitorDocument, String> {
-    let (snapshot, _) = start_tracking(path, WatchMode::FileDiff, state.inner(), &app)?;
-    let document = snapshot_to_monitor(&snapshot);
-    let _ = app.emit(
-        "tracking-changed",
-        TrackingChangedPayload {
-            document: Some(document.clone()),
-        },
-    );
-    Ok(document)
+fn start_monitor(path: String, state: State<'_, ClientState>) -> Result<MonitorDocument, String> {
+    Ok(snapshot_to_monitor(&client_track(&path, state.inner())?))
 }
 
 #[tauri::command]
-fn stop_tracking(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
-    let _processing = state
-        .file_processing
+fn stop_tracking(state: State<'_, ClientState>) -> Result<(), String> {
+    let _: StatusApiResponse = core_client::request_json::<StatusApiResponse, serde_json::Value>(
+        "POST",
+        "/v1/untrack",
+        None,
+    )?;
+    *state
+        .document
         .lock()
-        .map_err(|_| "File processing lock is poisoned".to_string())?;
-    reset_tracking_state(state.inner())?;
-    refresh_status_revision(state.inner())?;
-    let _ = app.emit(
-        "tracking-changed",
-        TrackingChangedPayload { document: None },
-    );
+        .map_err(|_| "Standalone client state lock is poisoned".to_string())? = None;
     Ok(())
 }
 
 #[tauri::command]
-fn open_document(
-    path: String,
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> Result<DocumentSnapshot, String> {
-    let (snapshot, _) = start_tracking(path, WatchMode::EditorNotice, state.inner(), &app)?;
-    Ok(snapshot)
+fn open_document(path: String, state: State<'_, ClientState>) -> Result<DocumentSnapshot, String> {
+    client_track(&path, state.inner())
 }
 
 #[tauri::command]
@@ -1349,16 +1471,23 @@ fn save_document(
     path: String,
     document_id: String,
     content: String,
-    state: State<'_, AppState>,
+    state: State<'_, ClientState>,
 ) -> Result<SaveResult, String> {
     let path = canonical_markdown_path(Path::new(&path))?;
     let before_hash = current_hash(&path)?;
-    let mut core = state
-        .core
+    let mut client_document = state
+        .document
         .lock()
-        .map_err(|_| "Writing Core lock is poisoned".to_string())?;
-    core.ensure_save_is_safe(&document_id, &path, &before_hash)
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "Standalone client state lock is poisoned".to_string())?;
+    let tracked = client_document
+        .as_mut()
+        .ok_or_else(|| "No document is open in the Standalone client".to_string())?;
+    if tracked.document_id != document_id || tracked.path != path {
+        return Err("Standalone client document identity changed".to_string());
+    }
+    if tracked.hash != before_hash {
+        return Err("Markdown changed outside the Standalone client".to_string());
+    }
     atomic_save(&path, &content)?;
     let bytes = content.as_bytes();
     let metadata =
@@ -1369,40 +1498,45 @@ fn save_document(
         mtime_ms: mtime_ms(&metadata),
         size: metadata.len(),
     };
-    core.mark_saved(&result.hash, result.mtime_ms, result.size, &content)
-        .map_err(|error| error.to_string())?;
-    drop(core);
-
-    if let Ok(mut watch) = state.watch.lock() {
-        watch.expected_hash = Some(result.hash.clone());
-        if watch.path.as_deref() == Some(path.as_path()) {
-            accept_last_good_snapshot(
-                &mut watch,
-                MemorySnapshot {
-                    content,
-                    hash: result.hash.clone(),
-                    mtime_ms: result.mtime_ms,
-                    size: result.size,
-                },
-            );
-        }
-    }
+    tracked.hash = result.hash.clone();
     Ok(result)
 }
 
 #[tauri::command]
-fn record_edit(event: EditEvent, state: State<'_, AppState>) -> Result<CoreStatus, String> {
+fn record_edit(
+    event: EditEvent,
+    content: String,
+    state: State<'_, ClientState>,
+) -> Result<CoreStatus, String> {
     debug_tauri_event("record_edit", &event);
-    let mut core = state
-        .core
+    let path = state
+        .document
         .lock()
-        .map_err(|_| "Writing Core lock is poisoned".to_string())?;
-    let status = core.record_edit(event).map_err(|error| error.to_string())?;
-    drop(core);
-    let tracking = tracking_path(state.inner())?.is_some();
-    sync_status_revision(state.inner(), &status, tracking)?;
-    debug_tauri_status("record_edit", &status);
-    Ok(status)
+        .map_err(|_| "Standalone client state lock is poisoned".to_string())?
+        .as_ref()
+        .map(|document| document.path.to_string_lossy().to_string())
+        .ok_or_else(|| "No document is open in the Standalone client".to_string())?;
+    let revision = {
+        let mut revision = state
+            .editor_revision
+            .lock()
+            .map_err(|_| "Standalone editor revision lock is poisoned".to_string())?;
+        *revision = revision.saturating_add(1);
+        *revision
+    };
+    let response: LiveSnapshotApiResponse = core_client::request_json(
+        "POST",
+        "/v1/snapshot",
+        Some(&LiveSnapshotApiRequest {
+            path,
+            content,
+            source: "standalone".to_string(),
+            editor_instance_id: state.editor_instance_id.clone(),
+            editor_revision: revision,
+            timestamp_ms: Some(event.timestamp_ms),
+        }),
+    )?;
+    Ok(status_api_to_core(response.status))
 }
 
 #[tauri::command]
@@ -1411,51 +1545,45 @@ fn get_writing_delta(old_markdown: String, new_markdown: String) -> WritingDelta
 }
 
 #[tauri::command]
-fn get_core_status(state: State<'_, AppState>) -> Result<CoreStatus, String> {
-    let mut core = state
-        .core
-        .lock()
-        .map_err(|_| "Writing Core lock is poisoned".to_string())?;
-    let status = core.status().map_err(|error| error.to_string())?;
-    drop(core);
-    let tracking = tracking_path(state.inner())?.is_some();
-    sync_status_revision(state.inner(), &status, tracking)?;
-    debug_tauri_status("get_core_status", &status);
-    Ok(status)
+fn get_core_status() -> Result<CoreStatus, String> {
+    let response: StatusApiResponse = core_client::request_json::<
+        StatusApiResponse,
+        serde_json::Value,
+    >("GET", "/v1/status", None)?;
+    Ok(status_api_to_core(response))
 }
 
 #[tauri::command]
-fn get_runtime_config(state: State<'_, AppState>) -> Result<RuntimeTimingConfig, String> {
-    let core = state
-        .core
-        .lock()
-        .map_err(|_| "Writing Core lock is poisoned".to_string())?;
-    Ok(core.runtime_timing())
+fn get_runtime_config() -> Result<RuntimeTimingConfig, String> {
+    core_client::request_json::<RuntimeTimingConfig, serde_json::Value>(
+        "GET",
+        "/v1/runtime-config",
+        None,
+    )
 }
 
 #[tauri::command]
 fn apply_debug_timing(
     idle_threshold_seconds: i64,
     session_end_threshold_seconds: i64,
-    state: State<'_, AppState>,
 ) -> Result<RuntimeTimingConfig, String> {
+    let _ = (idle_threshold_seconds, session_end_threshold_seconds);
     #[cfg(not(debug_assertions))]
     {
-        let _ = (idle_threshold_seconds, session_end_threshold_seconds, state);
+        let _ = (idle_threshold_seconds, session_end_threshold_seconds);
         return Err("Debug timing overrides are unavailable in release builds".to_string());
     }
 
     #[cfg(debug_assertions)]
     {
-        let mut core = state
-            .core
-            .lock()
-            .map_err(|_| "Writing Core lock is poisoned".to_string())?;
-        let config = core
-            .apply_debug_timing(idle_threshold_seconds, session_end_threshold_seconds)
-            .map_err(|error| error.to_string())?;
-        debug_runtime_config("apply_debug_timing", &config);
-        Ok(config)
+        core_client::request_json(
+            "POST",
+            "/v1/debug-timing",
+            Some(&DebugTimingApiRequest {
+                idle_threshold_seconds,
+                session_end_threshold_seconds,
+            }),
+        )
     }
 }
 
@@ -1563,6 +1691,48 @@ fn get_window_state_diagnostics(
     })
 }
 
+fn headless_data_dir() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os("WRITING_CORE_DATA_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(path) = env::var_os("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(path).join("com.caelorum.writing.spike"));
+    }
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is unavailable and WRITING_CORE_DATA_DIR is unset".to_string())?;
+    Ok(home.join(".local/share/com.caelorum.writing.spike"))
+}
+
+pub fn run_headless() -> Result<(), String> {
+    let data_dir = headless_data_dir()?;
+    let db_path = env::var_os("WRITING_CORE_DB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("writing-core.sqlite"));
+    let core_config = CoreConfig::from_env();
+    debug_runtime_config("headless-startup", &core_config.runtime_timing());
+    eprintln!(
+        "[CORE] starting headless runtime database={} bind=127.0.0.1:{}",
+        db_path.display(),
+        status_api::STATUS_API_PORT
+    );
+    let core = WritingCore::new(db_path, core_config).map_err(|error| error.to_string())?;
+    let state = Arc::new(AppState {
+        core: Mutex::new(core),
+        watcher: Mutex::new(None),
+        watch: Mutex::new(WatchState::default()),
+        file_processing: Mutex::new(()),
+        service_instance_id: Uuid::new_v4().to_string(),
+        revision: Mutex::new(RevisionTracker::new()),
+        tracking_state_path: data_dir.join("tracked-document.json"),
+    });
+    restore_tracking_state(&state);
+    let _status_api = StatusApiRuntime::start(Arc::clone(&state))?;
+    loop {
+        thread::park();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
@@ -1572,31 +1742,11 @@ pub fn run() {
 
     builder
         .setup(|app| {
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-            let db_path = data_dir.join("writing-core.sqlite");
-            let core_config = CoreConfig::from_env();
-            debug_runtime_config("startup", &core_config.runtime_timing());
-            let core = WritingCore::new(db_path, core_config)
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-            let service_instance_id = Uuid::new_v4().to_string();
-            app.manage(AppState {
-                core: Mutex::new(core),
-                watcher: Mutex::new(None),
-                watch: Mutex::new(WatchState::default()),
-                file_processing: Mutex::new(()),
-                service_instance_id,
-                revision: Mutex::new(RevisionTracker::new()),
-                status_api: Mutex::new(None),
+            app.manage(ClientState {
+                document: Mutex::new(None),
+                editor_instance_id: format!("standalone-{}", Uuid::new_v4()),
+                editor_revision: Mutex::new(0),
             });
-            let status_api = StatusApiRuntime::start(app.handle().clone());
-            if let Ok(mut runtime) = app.state::<AppState>().status_api.lock() {
-                *runtime = Some(status_api);
-            } else {
-                eprintln!("[STATUS API] runtime registration failed; API will stop with the app");
-            }
             #[cfg(desktop)]
             {
                 use tauri_plugin_window_state::AppHandleExt;
@@ -1657,7 +1807,6 @@ pub fn run() {
                     }
                 }
             }
-            RunEvent::Exit => shutdown_status_api(app),
             _ => {}
         });
 }

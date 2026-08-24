@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use tauri::AppHandle;
+use crate::AppState;
 
 pub const STATUS_API_PORT: u16 = 43180;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -27,7 +27,7 @@ pub struct StatusApiRuntime {
 }
 
 impl StatusApiRuntime {
-    pub fn start(app: AppHandle) -> Self {
+    pub fn start(state: Arc<AppState>) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let listener = match TcpListener::bind(("127.0.0.1", STATUS_API_PORT)) {
             Ok(listener) => listener,
@@ -35,7 +35,7 @@ impl StatusApiRuntime {
                 eprintln!(
                     "[STATUS API] unavailable: cannot bind 127.0.0.1:{STATUS_API_PORT}: {error}"
                 );
-                return Self { stop, join: None };
+                return Err(format!("cannot bind 127.0.0.1:{STATUS_API_PORT}: {error}"));
             }
         };
 
@@ -43,18 +43,20 @@ impl StatusApiRuntime {
             eprintln!(
                 "[STATUS API] unavailable: cannot configure 127.0.0.1:{STATUS_API_PORT}: {error}"
             );
-            return Self { stop, join: None };
+            return Err(format!(
+                "cannot configure 127.0.0.1:{STATUS_API_PORT}: {error}"
+            ));
         }
 
         let thread_stop = Arc::clone(&stop);
         let join = match thread::Builder::new()
             .name("writing-status-api".to_string())
-            .spawn(move || run_server(listener, app, thread_stop))
+            .spawn(move || run_server(listener, state, thread_stop))
         {
             Ok(join) => Some(join),
             Err(error) => {
                 eprintln!("[STATUS API] unavailable: cannot start server thread: {error}");
-                None
+                return Err(format!("cannot start server thread: {error}"));
             }
         };
 
@@ -62,7 +64,7 @@ impl StatusApiRuntime {
             eprintln!("[STATUS API] listening on http://127.0.0.1:{STATUS_API_PORT}/v1/status");
         }
 
-        Self { stop, join }
+        Ok(Self { stop, join })
     }
 
     pub fn shutdown(&mut self) {
@@ -81,10 +83,10 @@ impl Drop for StatusApiRuntime {
     }
 }
 
-fn run_server(listener: TcpListener, app: AppHandle, stop: Arc<AtomicBool>) {
+fn run_server(listener: TcpListener, state: Arc<AppState>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((mut stream, _peer)) => handle_connection(&mut stream, &app),
+            Ok((mut stream, _peer)) => handle_connection(&mut stream, &state),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25));
             }
@@ -96,7 +98,7 @@ fn run_server(listener: TcpListener, app: AppHandle, stop: Arc<AtomicBool>) {
     }
 }
 
-fn handle_connection(stream: &mut TcpStream, app: &AppHandle) {
+fn handle_connection(stream: &mut TcpStream, state: &Arc<AppState>) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let request = match read_http_request(stream) {
         Ok(request) => request,
@@ -108,14 +110,21 @@ fn handle_connection(stream: &mut TcpStream, app: &AppHandle) {
     let path = request.path.split('?').next().unwrap_or(&request.path);
 
     let result = match (request.method.as_str(), path) {
-        ("GET", "/v1/status") => crate::read_status_api_json(app),
+        ("GET", "/v1/status") => crate::read_status_api_json(state),
+        ("GET", "/v1/runtime-config") => crate::read_runtime_config_api_json(state),
         ("POST", "/v1/track") => serde_json::from_slice::<crate::TrackApiRequest>(&request.body)
             .map_err(|_| "invalid track request".to_string())
-            .and_then(|payload| crate::track_document_api_json(app, payload)),
+            .and_then(|payload| crate::track_document_api_json(state, payload)),
+        ("POST", "/v1/untrack") => crate::stop_tracking_api_json(state),
+        ("POST", "/v1/debug-timing") => {
+            serde_json::from_slice::<crate::DebugTimingApiRequest>(&request.body)
+                .map_err(|_| "invalid debug timing request".to_string())
+                .and_then(|payload| crate::apply_debug_timing_api_json(state, payload))
+        }
         ("POST", "/v1/snapshot") => {
             serde_json::from_slice::<crate::LiveSnapshotApiRequest>(&request.body)
                 .map_err(|_| "invalid snapshot request".to_string())
-                .and_then(|payload| crate::ingest_live_snapshot_api_json(app, payload))
+                .and_then(|payload| crate::ingest_live_snapshot_api_json(state, payload))
         }
         ("GET" | "POST", _) => {
             send_error(stream, "404 Not Found", "not_found", None);
