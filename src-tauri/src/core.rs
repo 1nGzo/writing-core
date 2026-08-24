@@ -220,7 +220,6 @@ pub struct WritingCore {
 impl WritingCore {
     pub fn new(db_path: PathBuf, config: CoreConfig) -> Result<Self, CoreError> {
         let storage = Storage::open(&db_path)?;
-        storage.finish_open_sessions(&config, epoch_seconds())?;
         Ok(Self {
             storage,
             config,
@@ -711,43 +710,6 @@ impl Storage {
                 writing_count.map(|_| WRITING_COUNT_VERSION),
             ],
         )?;
-        Ok(())
-    }
-
-    fn finish_open_sessions(&self, config: &CoreConfig, now: i64) -> Result<(), CoreError> {
-        let mut statement = self.conn.prepare(
-            "SELECT id, last_edit_at, active_seconds, idle_seconds
-             FROM sessions WHERE ended_at IS NULL",
-        )?;
-        let sessions = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-
-        for (id, last_edit_at, active_seconds, idle_seconds) in sessions {
-            let gap = (now - last_edit_at).max(0);
-            let accounted_gap = gap.min(config.session_end_seconds);
-            let active_increment = accounted_gap.min(config.active_grace_seconds());
-            let idle_increment = accounted_gap.saturating_sub(active_increment);
-            self.conn.execute(
-                "UPDATE sessions SET status = 'ended', ended_at = ?2,
-                    active_seconds = ?3, idle_seconds = ?4
-                 WHERE id = ?1",
-                params![
-                    id,
-                    last_edit_at + accounted_gap,
-                    active_seconds + active_increment,
-                    idle_seconds + idle_increment
-                ],
-            )?;
-        }
         Ok(())
     }
 
@@ -1306,39 +1268,38 @@ mod tests {
     }
 
     #[test]
-    fn restart_finalizes_open_session_with_active_and_idle_gap() {
-        let database = Storage::open(Path::new(":memory:")).expect("database");
-        database
-            .conn
-            .execute(
-                "INSERT INTO documents (id, path, created_at, updated_at, last_hash, last_mtime_ms, last_size)
-                 VALUES ('doc', 'test.md', 0, 0, '', 0, 0)",
-                [],
-            )
-            .expect("document");
-        database
-            .record_event(
-                "doc",
-                event("doc", 1_000, "file.diff", "file_diff", 1, 0),
-                &config(),
+    fn reopening_core_keeps_open_session_for_session_continuity() {
+        let database_path = std::env::temp_dir().join(format!(
+            "caelorum-writing-core-reopen-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let session_id = {
+            let mut core = WritingCore::new(database_path.clone(), config()).expect("core");
+            let document_id = core.open_document(&snapshot()).expect("open");
+            core.record_edit_at(
+                event(&document_id, 1_000, "file.diff", "file_diff", 1, 0),
+                1,
             )
             .expect("first event");
+            core.status_at(2).expect("status").session_id.unwrap()
+        };
 
-        database
-            .finish_open_sessions(&config(), 31)
-            .expect("finalize open session");
+        let reopened_status = {
+            let mut core =
+                WritingCore::new(database_path.clone(), config()).expect("reopened core");
+            core.open_document(&snapshot()).expect("reopen document");
+            core.status_at(3).expect("reopened status")
+        };
 
-        let session = database
-            .latest_session("doc")
-            .expect("query")
-            .expect("session");
-        assert_eq!(session.status, "ended");
-        assert_eq!(session.ended_at, Some(31));
-        assert_eq!(session.active_seconds, 10);
-        assert_eq!(session.idle_seconds, 20);
         assert_eq!(
-            session.ended_at.unwrap() - session.started_at,
-            session.active_seconds + session.idle_seconds
+            reopened_status.session_id.as_deref(),
+            Some(session_id.as_str())
         );
+        assert_eq!(reopened_status.state, "active");
+        assert_eq!(reopened_status.session_writing_net_units, Some(1));
+
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite-shm"));
     }
 }
