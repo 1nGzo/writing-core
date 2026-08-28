@@ -3,7 +3,7 @@
 set -euo pipefail
 
 APP="$HOME/.local/lib/caelorum-writing-monitor/caelorum-writing-spike"
-SOURCE_PROJECT="/home/ingzo28/Projects/writing-core/caelorum-writing-spike"
+SOURCE_PROJECT="/home/ingzo28/CaelOS/writing-monitor"
 
 if [[ ! -x "$APP" ]]; then
   printf '%s\n' 'Writing Monitor executable not found.' >&2

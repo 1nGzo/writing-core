@@ -101,7 +101,7 @@ Headless 开发运行可使用 `cargo run --manifest-path src-tauri/Cargo.toml -
 当前验证机没有系统级 WebKitGTK 4.1 / rsvg2 开发包，之前验证使用了 `/tmp/caelorum-writing-sysroot` 临时用户态 sysroot。先在终端加载 Rust：
 
 ```bash
-cd /home/ingzo28/Projects/writing-core/caelorum-writing-spike
+cd /home/ingzo28/CaelOS/writing-monitor
 . /home/ingzo28/.cargo/env
 ```
 
