@@ -275,25 +275,12 @@ pub(crate) struct DebugTimingApiRequest {
     session_end_threshold_seconds: i64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) struct SessionEndApiRequest {
-    #[serde(default)]
-    session_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct LiveSnapshotApiResponse {
     accepted: bool,
     reason: Option<String>,
     status: StatusApiResponse,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-struct SessionEndApiResponse {
-    ended: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -621,11 +608,13 @@ fn reset_tracking_state(state: &AppState) -> Result<(), String> {
     watch.last_external_notice = None;
     watch.editor_revisions.clear();
     drop(watch);
-    state
+    let mut core = state
         .core
         .lock()
-        .map_err(|_| "Writing Core lock is poisoned".to_string())?
-        .close_document();
+        .map_err(|_| "Writing Core lock is poisoned".to_string())?;
+    core.end_current_session()
+        .map_err(|error| error.to_string())?;
+    core.close_document();
     Ok(())
 }
 
@@ -686,23 +675,6 @@ pub(crate) fn read_status_api_json(state: &AppState) -> Result<Vec<u8>, String> 
     serde_json::to_vec(&read_status_api_response(state)?).map_err(|error| error.to_string())
 }
 
-pub(crate) fn end_session_api_json(
-    state: &AppState,
-    request: SessionEndApiRequest,
-) -> Result<Vec<u8>, String> {
-    let _processing = state
-        .file_processing
-        .lock()
-        .map_err(|_| "File processing lock is poisoned".to_string())?;
-    let ended = state
-        .core
-        .lock()
-        .map_err(|_| "Writing Core lock is poisoned".to_string())?
-        .end_current_session_for(request.session_id.as_deref())
-        .map_err(|error| error.to_string())?;
-    serde_json::to_vec(&SessionEndApiResponse { ended }).map_err(|error| error.to_string())
-}
-
 pub(crate) fn read_daily_stats_api_json(state: &AppState, days: usize) -> Result<Vec<u8>, String> {
     let stats = state
         .core
@@ -751,7 +723,11 @@ pub(crate) fn track_document_api_json(
     state: &Arc<AppState>,
     request: TrackApiRequest,
 ) -> Result<Vec<u8>, String> {
-    let (snapshot, _) = start_tracking(request.path, WatchMode::FileDiff, state)?;
+    let _processing = state
+        .file_processing
+        .lock()
+        .map_err(|_| "File processing lock is poisoned".to_string())?;
+    let (snapshot, _) = start_tracking_under_processing(request.path, WatchMode::FileDiff, state)?;
     persist_tracking_state(state, Path::new(&snapshot.path))?;
     read_status_api_json(state)
 }
@@ -1453,6 +1429,14 @@ fn start_tracking(
         .file_processing
         .lock()
         .map_err(|_| "File processing lock is poisoned".to_string())?;
+    start_tracking_under_processing(path, mode, state)
+}
+
+fn start_tracking_under_processing(
+    path: String,
+    mode: WatchMode,
+    state: &Arc<AppState>,
+) -> Result<(DocumentSnapshot, MemorySnapshot), String> {
     reset_tracking_state(state)?;
     let snapshot = read_document(Path::new(&path))?;
     let memory = MemorySnapshot {
@@ -1909,6 +1893,23 @@ mod tests {
         }
     }
 
+    fn endpoint_test_state(root: &Path) -> Arc<AppState> {
+        let core = WritingCore::new(
+            root.join("writing-core.sqlite"),
+            CoreConfig::new(10, 60).expect("test timing"),
+        )
+        .expect("test core");
+        Arc::new(AppState {
+            core: Mutex::new(core),
+            watcher: Mutex::new(None),
+            watch: Mutex::new(WatchState::default()),
+            file_processing: Mutex::new(()),
+            service_instance_id: "endpoint-test-core".to_string(),
+            revision: Mutex::new(RevisionTracker::new()),
+            tracking_state_path: root.join("tracked-document.json"),
+        })
+    }
+
     #[test]
     fn atomic_replace_append_compares_against_last_good_snapshot() {
         let old_text = "a".repeat(8628);
@@ -2010,6 +2011,104 @@ mod tests {
             live_snapshot_decision(&previous, None, 1, &next).unwrap(),
             LiveSnapshotDecision::Changed(_)
         ));
+    }
+
+    #[test]
+    fn untrack_invalidates_stale_snapshot_watcher_and_restart_until_explicit_track() {
+        let root = env::temp_dir().join(format!("writing-core-untrack-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create test root");
+        let document_path = root.join("A.md");
+        fs::write(&document_path, "初始正文").expect("write baseline");
+        let state = endpoint_test_state(&root);
+
+        let tracked = track_document_api_json(
+            &state,
+            TrackApiRequest {
+                path: document_path.to_string_lossy().to_string(),
+            },
+        )
+        .expect("track document");
+        let tracked: serde_json::Value = serde_json::from_slice(&tracked).expect("tracked status");
+        assert_eq!(tracked["tracking"], true);
+        assert!(state.tracking_state_path.is_file());
+        let stale_generation = state.watch.lock().expect("watch").generation;
+
+        let untracked = stop_tracking_api_json(&state).expect("untrack document");
+        let untracked: serde_json::Value =
+            serde_json::from_slice(&untracked).expect("untracked status");
+        assert_eq!(untracked["tracking"], false);
+        assert!(untracked["document"].is_null());
+        assert!(untracked["session"].is_null());
+        assert!(!state.tracking_state_path.exists());
+
+        let stale_snapshot = ingest_live_snapshot_api_json(
+            &state,
+            LiveSnapshotApiRequest {
+                path: document_path.to_string_lossy().to_string(),
+                content: "初始正文迟到快照".to_string(),
+                source: "caelorum".to_string(),
+                editor_instance_id: "stale-editor".to_string(),
+                editor_revision: 1,
+                timestamp_ms: Some(1_000),
+            },
+        )
+        .expect_err("stale snapshot must be rejected after untrack");
+        assert_eq!(
+            stale_snapshot,
+            "tracked document does not match snapshot path"
+        );
+
+        fs::write(&document_path, "取消后磁盘保存").expect("simulate save after untrack");
+        let saved = read_memory_snapshot(&document_path).expect("saved snapshot");
+        process_file_snapshot(&state, &document_path, stale_generation, saved);
+        let after_save = read_status_api_response(&state).expect("status after save");
+        assert!(!after_save.tracking);
+        assert!(after_save.document.is_none());
+        assert!(after_save.session.is_none());
+
+        let restarted = endpoint_test_state(&root);
+        restore_tracking_state(&restarted);
+        let after_restart = read_status_api_response(&restarted).expect("status after restart");
+        assert!(!after_restart.tracking);
+        assert!(after_restart.document.is_none());
+
+        let retracked = track_document_api_json(
+            &restarted,
+            TrackApiRequest {
+                path: document_path.to_string_lossy().to_string(),
+            },
+        )
+        .expect("explicitly re-track document");
+        let retracked: serde_json::Value =
+            serde_json::from_slice(&retracked).expect("retracked status");
+        assert_eq!(retracked["tracking"], true);
+        let disk_before_live = fs::read(&document_path).expect("disk before live snapshot");
+        let accepted = ingest_live_snapshot_api_json(
+            &restarted,
+            LiveSnapshotApiRequest {
+                path: document_path.to_string_lossy().to_string(),
+                content: "取消后磁盘保存重新监控输入".to_string(),
+                source: "caelorum".to_string(),
+                editor_instance_id: "fresh-editor".to_string(),
+                editor_revision: 1,
+                timestamp_ms: Some(2_000),
+            },
+        )
+        .expect("snapshot after explicit re-track");
+        let accepted: serde_json::Value =
+            serde_json::from_slice(&accepted).expect("accepted snapshot response");
+        assert_eq!(accepted["accepted"], true);
+        assert_eq!(accepted["status"]["tracking"], true);
+        assert_eq!(accepted["status"]["activity_state"], "active");
+        assert_eq!(
+            fs::read(&document_path).expect("disk after snapshot"),
+            disk_before_live
+        );
+
+        stop_tracking_api_json(&restarted).expect("final untrack");
+        drop(restarted);
+        drop(state);
+        fs::remove_dir_all(&root).expect("remove test root");
     }
 
     #[test]

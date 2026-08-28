@@ -375,43 +375,26 @@ impl WritingCore {
         self.status_at_with_persistence(epoch_seconds(), false)
     }
 
+    // Used when tracking stops: the open session must close under the same
+    // rules as an automatic end so a later edit never resumes it.
     pub fn end_current_session(&mut self) -> Result<bool, CoreError> {
-        self.end_current_session_for_at(None, epoch_seconds())
+        self.end_current_session_at(epoch_seconds())
     }
 
-    pub fn end_current_session_for(&mut self, session_id: Option<&str>) -> Result<bool, CoreError> {
-        self.end_current_session_for_at(session_id, epoch_seconds())
-    }
-
-    #[cfg(test)]
     fn end_current_session_at(&mut self, now: i64) -> Result<bool, CoreError> {
-        self.end_current_session_for_at(None, now)
-    }
-
-    fn end_current_session_for_at(
-        &mut self,
-        session_id: Option<&str>,
-        now: i64,
-    ) -> Result<bool, CoreError> {
         let Some(document) = &self.current_document else {
             return Ok(false);
         };
-        let session = match session_id {
-            Some(session_id) => self
-                .storage
-                .session_for_document(session_id, &document.id)?,
-            None => self.storage.latest_session(&document.id)?,
-        };
-        let Some(session) = session else {
+        let Some(session) = self.storage.latest_session(&document.id)? else {
             return Ok(false);
         };
         if session.ended_at.is_some() {
             return Ok(false);
         }
 
-        // Apply the same automatic-end boundary used by status/record_event if
-        // the request arrives after a long unattended gap. Otherwise an
-        // explicit end closes the session at the actual request time.
+        // Follow the automatic-end boundary used by status/record_event: a
+        // session never extends past its last edit by more than the
+        // session-end threshold, even when the close arrives later.
         let requested_end = now.max(session.last_edit_at);
         let gap = requested_end.saturating_sub(session.last_edit_at);
         let effective_end = session.last_edit_at + gap.min(self.config.session_end_seconds);
@@ -809,43 +792,6 @@ impl Storage {
                         writing_count_version
                  FROM sessions WHERE document_id = ?1 ORDER BY started_at DESC LIMIT 1",
                 params![document_id],
-                |row| {
-                    Ok(SessionRow {
-                        id: row.get(0)?,
-                        started_at: row.get(1)?,
-                        last_edit_at: row.get(2)?,
-                        ended_at: row.get(3)?,
-                        status: row.get(4)?,
-                        tracking_origin: row.get(5)?,
-                        inserted_chars: row.get(6)?,
-                        deleted_chars: row.get(7)?,
-                        net_chars: row.get(8)?,
-                        active_seconds: row.get(9)?,
-                        idle_seconds: row.get(10)?,
-                        writing_inserted_units: row.get(11)?,
-                        writing_deleted_units: row.get(12)?,
-                        writing_net_units: row.get(13)?,
-                        writing_count_version: row.get(14)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(CoreError::from)
-    }
-
-    fn session_for_document(
-        &self,
-        session_id: &str,
-        document_id: &str,
-    ) -> Result<Option<SessionRow>, CoreError> {
-        self.conn
-            .query_row(
-                "SELECT id, started_at, last_edit_at, ended_at, status, tracking_origin,
-                        inserted_chars, deleted_chars, net_chars, active_seconds, idle_seconds,
-                        writing_inserted_units, writing_deleted_units, writing_net_units,
-                        writing_count_version
-                 FROM sessions WHERE id = ?1 AND document_id = ?2",
-                params![session_id, document_id],
                 |row| {
                     Ok(SessionRow {
                         id: row.get(0)?,
@@ -1553,90 +1499,53 @@ mod tests {
     }
 
     #[test]
-    fn explicit_end_closes_active_session_idempotently_and_next_edit_restarts_it() {
+    fn untrack_close_is_a_noop_without_a_document_or_open_session() {
         let mut core = WritingCore::new(PathBuf::from(":memory:"), config()).expect("core");
+        assert!(!core.end_current_session_at(1).expect("no document"));
+
         let document_id = core.open_document(&snapshot()).expect("open");
-        let first_status = core
-            .record_edit_at(
-                event(&document_id, 1_000, "file.diff", "file_diff", 3, 0),
-                1,
-            )
-            .expect("first edit");
-        let session_id = first_status.session_id.clone().expect("session id");
-
-        assert!(core.end_current_session_at(6).expect("end active session"));
-        assert!(!core.end_current_session_at(7).expect("repeat end"));
-        let ended = core.status_at(7).expect("ended status");
-        assert_eq!(ended.state, "ended");
-        assert_eq!(ended.session_id.as_deref(), Some(session_id.as_str()));
-        assert_eq!(ended.session_span_seconds, 5);
-        assert_eq!(ended.session_active_seconds, 5);
-        assert_eq!(ended.session_idle_seconds, 0);
-
-        let resumed = core
-            .record_edit_at(
-                event(&document_id, 8_000, "file.diff", "file_diff", 2, 0),
-                8,
-            )
-            .expect("new edit");
-        assert_ne!(resumed.session_id.as_deref(), Some(session_id.as_str()));
-        assert_eq!(resumed.state, "active");
-    }
-
-    #[test]
-    fn explicit_end_target_does_not_close_a_newer_session_after_a_retry() {
-        let mut core = WritingCore::new(PathBuf::from(":memory:"), config()).expect("core");
-        let document_id = core.open_document(&snapshot()).expect("open");
-        let first = core
-            .record_edit_at(
-                event(&document_id, 1_000, "file.diff", "file_diff", 1, 0),
-                1,
-            )
-            .expect("first edit");
-        let first_session_id = first.session_id.expect("first session");
-        assert!(core
-            .end_current_session_for_at(Some(first_session_id.as_str()), 2)
-            .expect("end first session"));
-
-        let second = core
-            .record_edit_at(
-                event(&document_id, 3_000, "file.diff", "file_diff", 2, 0),
-                3,
-            )
-            .expect("second session edit");
-        let second_session_id = second.session_id.expect("second session");
-        assert!(!core
-            .end_current_session_for_at(Some(first_session_id.as_str()), 4)
-            .expect("retry first end"));
-        let current = core.status_at(4).expect("current status");
-        assert_eq!(
-            current.session_id.as_deref(),
-            Some(second_session_id.as_str())
-        );
-        assert_eq!(current.state, "active");
-    }
-
-    #[test]
-    fn explicit_end_preserves_idle_history_and_is_safe_without_a_session() {
-        let mut no_session = WritingCore::new(PathBuf::from(":memory:"), config()).expect("core");
-        assert!(!no_session.end_current_session().expect("no-op end"));
-
-        let mut core = WritingCore::new(PathBuf::from(":memory:"), config()).expect("core");
-        let document_id = core.open_document(&snapshot()).expect("open");
+        assert!(!core.end_current_session_at(2).expect("no session"));
         core.record_edit_at(
             event(&document_id, 1_000, "file.diff", "file_diff", 1, 0),
             1,
         )
         .expect("edit");
-        assert!(core.end_current_session_at(31).expect("end idle session"));
-        let ended = core.status_at(31).expect("ended status");
-        assert_eq!(ended.state, "ended");
-        assert_eq!(ended.session_active_seconds, 10);
-        assert_eq!(ended.session_idle_seconds, 20);
-        assert_eq!(
-            ended.session_span_seconds,
-            ended.session_active_seconds + ended.session_idle_seconds
-        );
+        assert!(core.end_current_session_at(2).expect("close open session"));
+        assert!(!core.end_current_session_at(3).expect("already closed"));
+    }
+
+    #[test]
+    fn untrack_close_uses_the_automatic_boundary_and_the_next_edit_restarts_it() {
+        let mut core = WritingCore::new(PathBuf::from(":memory:"), config()).expect("core");
+        let document_id = core.open_document(&snapshot()).expect("open");
+        let first = core
+            .record_edit_at(
+                event(&document_id, 1_000, "file.diff", "file_diff", 3, 0),
+                1,
+            )
+            .expect("first edit");
+        let session_id = first.session_id.clone().expect("session id");
+
+        assert!(core.end_current_session_at(31).expect("close on untrack"));
+        core.close_document();
+        core.open_document(&snapshot()).expect("re-track document");
+        let retained = core.status_at(32).expect("status after re-track");
+        assert_eq!(retained.state, "ended");
+        assert_eq!(retained.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(retained.session_span_seconds, 30);
+        assert_eq!(retained.session_active_seconds, 10);
+        assert_eq!(retained.session_idle_seconds, 20);
+
+        let next = core
+            .record_edit_at(
+                event(&document_id, 33_000, "file.diff", "file_diff", 2, 0),
+                33,
+            )
+            .expect("next edit");
+        assert_ne!(next.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(next.state, "active");
+        assert_eq!(next.session_writing_net_units, Some(2));
+        assert_eq!(next.session_span_seconds, 0);
     }
 
     #[test]

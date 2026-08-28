@@ -156,14 +156,21 @@ identity, Core state, and file watcher as Standalone Monitor selection.
 
 `POST /v1/untrack` clears the current tracked document and its persisted
 selection. It has no request body and does not delete正文 or historical SQLite
-records.
+records. If an open session exists, it is closed first under the same
+boundary rules as an automatic session end: the effective end never extends
+past the last accepted edit by more than the session-end threshold, the final
+interval is split into active/idle with the active grace boundary, and the
+closed session never resumes. A later accepted real正文 change naturally
+creates a new session only after `/v1/track` selects the document again.
 
 `POST /v1/snapshot` accepts a stable full Markdown snapshot from an editor
 adapter. Its JSON body contains `path`, `content`, fixed adapter `source`,
 `editor_instance_id`, monotonic per-instance `editor_revision`, and an optional
 client `timestamp_ms`. Core uses its own receive time for activity/session
 policy. Requests are capped at 1 MiB of content;正文 is kept only in the existing
-in-memory snapshot path and is never logged.
+in-memory snapshot path and is never logged. A snapshot is accepted only when
+its canonical path matches the document already selected by `/v1/track`;
+snapshot ingestion never selects or restores a tracked document implicitly.
 
 Accepted live snapshots and later file-watch saves share the same latest
 snapshot/hash baseline. Saving the exact live content therefore updates the
@@ -174,27 +181,11 @@ collaborative merging.
 `GET /v1/runtime-config` returns the Core-owned idle/session-end thresholds for
 trusted local UI clients. It does not expose正文 or mutable state.
 
-`POST /v1/session/end` closes only the current open session for the currently
-tracked document. Its optional JSON body may target the session observed by the
-client:
-
-```json
-{ "session_id": "opaque-session-id" }
-```
-
-An empty body is also accepted and means the latest open session. The response
-is always `200 OK` for a valid request:
-
-```json
-{ "ended": true }
-```
-
-`ended: false` is the idempotent no-op result when there is no open matching
-session. The route does not untrack the document, stop File Watch, save or
-modify Markdown, clear history, or stop the Core process. A later accepted
-real正文 change naturally creates a new session. When a client has a session
-identity, it should send that identity so a delayed retry cannot close a newer
-session.
+Session lifecycle is fully automatic: a session opens on the first accepted
+real正文 edit, transitions active/idle from edit timing, and closes when the
+idle gap reaches the session-end threshold. There is no manual session-end
+route; untracking is the only client-driven way to close an open session
+early, and it also stops tracking (see `/v1/untrack`).
 
 ## Daily statistics
 
@@ -240,8 +231,8 @@ sessions: each accepted edit starts an active/thinking interval that ends at
 the next accepted edit, the session end, or the idle-threshold grace boundary,
 whichever comes first. Overlapping/adjacent intervals are accounted for once,
 then each interval is split at local midnight. An open session is evaluated up
-to the request time, capped at its session-end boundary. Explicit or automatic
-session end therefore clips the final interval. This makes the sum of daily
+to the request time, capped at its session-end boundary. Automatic (or
+untrack-triggered) session end therefore clips the final interval. This makes the sum of daily
 active seconds agree with the session active total for exact test timelines,
 including sessions crossing midnight.
 

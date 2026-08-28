@@ -119,15 +119,6 @@ fn handle_connection(stream: &mut TcpStream, state: &Arc<AppState>) {
             .map_err(|_| "invalid track request".to_string())
             .and_then(|payload| crate::track_document_api_json(state, payload)),
         ("POST", "/v1/untrack") => crate::stop_tracking_api_json(state),
-        ("POST", "/v1/session/end") => {
-            let payload = if request.body.is_empty() {
-                Ok(crate::SessionEndApiRequest::default())
-            } else {
-                serde_json::from_slice::<crate::SessionEndApiRequest>(&request.body)
-                    .map_err(|_| "invalid session end request".to_string())
-            };
-            payload.and_then(|payload| crate::end_session_api_json(state, payload))
-        }
         ("POST", "/v1/debug-timing") => {
             serde_json::from_slice::<crate::DebugTimingApiRequest>(&request.body)
                 .map_err(|_| "invalid debug timing request".to_string())
