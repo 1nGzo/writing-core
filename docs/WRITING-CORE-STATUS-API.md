@@ -1,8 +1,8 @@
 # Writing Core Status API v1
 
 This document describes the local v1 integration contract. Status remains a
-stable read-only view; the two loopback-only mutation routes are narrow editor
-adapter inputs owned by Writing Core.
+stable read-only view; the loopback-only mutation routes are narrow editor and
+session-control inputs owned by Writing Core.
 
 ## Endpoint
 
@@ -173,6 +173,82 @@ collaborative merging.
 
 `GET /v1/runtime-config` returns the Core-owned idle/session-end thresholds for
 trusted local UI clients. It does not expose正文 or mutable state.
+
+`POST /v1/session/end` closes only the current open session for the currently
+tracked document. Its optional JSON body may target the session observed by the
+client:
+
+```json
+{ "session_id": "opaque-session-id" }
+```
+
+An empty body is also accepted and means the latest open session. The response
+is always `200 OK` for a valid request:
+
+```json
+{ "ended": true }
+```
+
+`ended: false` is the idempotent no-op result when there is no open matching
+session. The route does not untrack the document, stop File Watch, save or
+modify Markdown, clear history, or stop the Core process. A later accepted
+real正文 change naturally creates a new session. When a client has a session
+identity, it should send that identity so a delayed retry cannot close a newer
+session.
+
+## Daily statistics
+
+```text
+GET http://127.0.0.1:43180/v1/stats/daily?days=7
+```
+
+The endpoint is independent of `/v1/status`; status schema v1 is unchanged.
+`days` defaults to `7` and is accepted from `1` through `31`. The response
+contains no正文, Markdown snapshot, absolute path, or diff content:
+
+```json
+{
+  "schema_version": 1,
+  "days": [
+    {
+      "date": "2026-08-22",
+      "writing_net_units": 721,
+      "active_seconds": 3812
+    },
+    {
+      "date": "2026-08-23",
+      "writing_net_units": 0,
+      "active_seconds": 0
+    }
+  ]
+}
+```
+
+The actual response contains exactly `days` contiguous local calendar dates,
+including today, ordered oldest to newest. Days with no facts are returned as
+zero. The scope is the whole Writing Core history across all documents and
+sessions, not only the currently selected chapter. Accepted live snapshots
+are already Core facts and are included; a later same-content File Watch save
+is deduplicated by the existing snapshot/hash path.
+
+`writing_net_units` is the sum of each accepted Writing Count v1 edit event's
+writing net (`inserted - deleted`), so negative days remain negative. It is not
+clamped to zero and is not reconstructed from a document-total difference.
+
+`active_seconds` is reconstructed with the same Core semantics used by
+sessions: each accepted edit starts an active/thinking interval that ends at
+the next accepted edit, the session end, or the idle-threshold grace boundary,
+whichever comes first. Overlapping/adjacent intervals are accounted for once,
+then each interval is split at local midnight. An open session is evaluated up
+to the request time, capped at its session-end boundary. Explicit or automatic
+session end therefore clips the final interval. This makes the sum of daily
+active seconds agree with the session active total for exact test timelines,
+including sessions crossing midnight.
+
+The local calendar and midnight boundaries use the timezone of the Writing
+Core process. This endpoint is loopback-only and is intended to be consumed by
+the Browser same-origin proxy or another trusted local client; consumers must
+not query the SQLite database directly.
 
 Debug builds also accept `POST /v1/debug-timing` from the Standalone client;
 release Headless Core builds reject it. Production defaults and environment

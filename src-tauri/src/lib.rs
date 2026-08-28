@@ -275,12 +275,25 @@ pub(crate) struct DebugTimingApiRequest {
     session_end_threshold_seconds: i64,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct SessionEndApiRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct LiveSnapshotApiResponse {
     accepted: bool,
     reason: Option<String>,
     status: StatusApiResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct SessionEndApiResponse {
+    ended: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -671,6 +684,33 @@ fn read_status_api_response(state: &AppState) -> Result<StatusApiResponse, Strin
 
 pub(crate) fn read_status_api_json(state: &AppState) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&read_status_api_response(state)?).map_err(|error| error.to_string())
+}
+
+pub(crate) fn end_session_api_json(
+    state: &AppState,
+    request: SessionEndApiRequest,
+) -> Result<Vec<u8>, String> {
+    let _processing = state
+        .file_processing
+        .lock()
+        .map_err(|_| "File processing lock is poisoned".to_string())?;
+    let ended = state
+        .core
+        .lock()
+        .map_err(|_| "Writing Core lock is poisoned".to_string())?
+        .end_current_session_for(request.session_id.as_deref())
+        .map_err(|error| error.to_string())?;
+    serde_json::to_vec(&SessionEndApiResponse { ended }).map_err(|error| error.to_string())
+}
+
+pub(crate) fn read_daily_stats_api_json(state: &AppState, days: usize) -> Result<Vec<u8>, String> {
+    let stats = state
+        .core
+        .lock()
+        .map_err(|_| "Writing Core lock is poisoned".to_string())?
+        .daily_stats(days)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_vec(&stats).map_err(|error| error.to_string())
 }
 
 pub(crate) fn read_runtime_config_api_json(state: &AppState) -> Result<Vec<u8>, String> {

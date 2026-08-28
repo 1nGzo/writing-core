@@ -111,11 +111,23 @@ fn handle_connection(stream: &mut TcpStream, state: &Arc<AppState>) {
 
     let result = match (request.method.as_str(), path) {
         ("GET", "/v1/status") => crate::read_status_api_json(state),
+        ("GET", "/v1/stats/daily") => {
+            parse_days(&request.path).and_then(|days| crate::read_daily_stats_api_json(state, days))
+        }
         ("GET", "/v1/runtime-config") => crate::read_runtime_config_api_json(state),
         ("POST", "/v1/track") => serde_json::from_slice::<crate::TrackApiRequest>(&request.body)
             .map_err(|_| "invalid track request".to_string())
             .and_then(|payload| crate::track_document_api_json(state, payload)),
         ("POST", "/v1/untrack") => crate::stop_tracking_api_json(state),
+        ("POST", "/v1/session/end") => {
+            let payload = if request.body.is_empty() {
+                Ok(crate::SessionEndApiRequest::default())
+            } else {
+                serde_json::from_slice::<crate::SessionEndApiRequest>(&request.body)
+                    .map_err(|_| "invalid session end request".to_string())
+            };
+            payload.and_then(|payload| crate::end_session_api_json(state, payload))
+        }
         ("POST", "/v1/debug-timing") => {
             serde_json::from_slice::<crate::DebugTimingApiRequest>(&request.body)
                 .map_err(|_| "invalid debug timing request".to_string())
@@ -154,6 +166,53 @@ fn handle_connection(stream: &mut TcpStream, state: &Arc<AppState>) {
             eprintln!("[STATUS API] request rejected path={path} error={error}");
             send_error(stream, status, code, None);
         }
+    }
+}
+
+fn parse_days(request_path: &str) -> Result<usize, String> {
+    let Some(query) = request_path.split_once('?').map(|(_, query)| query) else {
+        return Ok(7);
+    };
+    let mut days = None;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (name, value) = pair
+            .split_once('=')
+            .ok_or_else(|| "daily stats query is invalid".to_string())?;
+        if name == "days" {
+            if days.is_some() {
+                return Err("daily stats days is duplicated".to_string());
+            }
+            days = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|_| "daily stats days is invalid".to_string())?,
+            );
+        }
+    }
+    Ok(days.unwrap_or(7))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_days;
+
+    #[test]
+    fn daily_stats_query_defaults_to_seven_days() {
+        assert_eq!(parse_days("/v1/stats/daily").expect("default days"), 7);
+        assert_eq!(
+            parse_days("/v1/stats/daily?days=7").expect("explicit days"),
+            7
+        );
+    }
+
+    #[test]
+    fn daily_stats_query_rejects_malformed_or_duplicate_days() {
+        assert!(parse_days("/v1/stats/daily?days=seven").is_err());
+        assert!(parse_days("/v1/stats/daily?days=7&days=7").is_err());
+        assert_eq!(
+            parse_days("/v1/stats/daily?days=0").expect("core validates range"),
+            0
+        );
     }
 }
 

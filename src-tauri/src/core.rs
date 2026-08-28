@@ -1,9 +1,11 @@
 use std::{
+    collections::HashMap,
     env,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use chrono::{Duration as ChronoDuration, Local, LocalResult, NaiveDate, TimeZone};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -27,6 +29,8 @@ pub enum CoreError {
         "invalid runtime timing: idle_threshold_seconds must be > 0 and session_end_threshold_seconds must be greater than idle_threshold_seconds"
     )]
     InvalidRuntimeTiming,
+    #[error("daily stats days must be between 1 and 31")]
+    InvalidDailyStatsDays,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +186,21 @@ pub struct CoreStatus {
     pub session_writing_count_version: Option<i64>,
     pub document_writing_count: Option<i64>,
     pub tracking_origin: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct DailyWritingStat {
+    pub date: String,
+    pub writing_net_units: i64,
+    pub active_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct DailyStatsResponse {
+    pub schema_version: u8,
+    pub days: Vec<DailyWritingStat>,
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +373,74 @@ impl WritingCore {
 
     pub fn status_read_only(&mut self) -> Result<CoreStatus, CoreError> {
         self.status_at_with_persistence(epoch_seconds(), false)
+    }
+
+    pub fn end_current_session(&mut self) -> Result<bool, CoreError> {
+        self.end_current_session_for_at(None, epoch_seconds())
+    }
+
+    pub fn end_current_session_for(&mut self, session_id: Option<&str>) -> Result<bool, CoreError> {
+        self.end_current_session_for_at(session_id, epoch_seconds())
+    }
+
+    #[cfg(test)]
+    fn end_current_session_at(&mut self, now: i64) -> Result<bool, CoreError> {
+        self.end_current_session_for_at(None, now)
+    }
+
+    fn end_current_session_for_at(
+        &mut self,
+        session_id: Option<&str>,
+        now: i64,
+    ) -> Result<bool, CoreError> {
+        let Some(document) = &self.current_document else {
+            return Ok(false);
+        };
+        let session = match session_id {
+            Some(session_id) => self
+                .storage
+                .session_for_document(session_id, &document.id)?,
+            None => self.storage.latest_session(&document.id)?,
+        };
+        let Some(session) = session else {
+            return Ok(false);
+        };
+        if session.ended_at.is_some() {
+            return Ok(false);
+        }
+
+        // Apply the same automatic-end boundary used by status/record_event if
+        // the request arrives after a long unattended gap. Otherwise an
+        // explicit end closes the session at the actual request time.
+        let requested_end = now.max(session.last_edit_at);
+        let gap = requested_end.saturating_sub(session.last_edit_at);
+        let effective_end = session.last_edit_at + gap.min(self.config.session_end_seconds);
+        let active_increment = gap.min(self.config.active_grace_seconds());
+        let idle_increment = effective_end
+            .saturating_sub(session.last_edit_at)
+            .saturating_sub(active_increment);
+        self.storage.end_session(
+            &session.id,
+            effective_end,
+            session.active_seconds + active_increment,
+            session.idle_seconds + idle_increment,
+        )?;
+        Ok(true)
+    }
+
+    pub fn daily_stats(&self, days: usize) -> Result<DailyStatsResponse, CoreError> {
+        if !(1..=31).contains(&days) {
+            return Err(CoreError::InvalidDailyStatsDays);
+        }
+        self.storage
+            .daily_stats_at(epoch_seconds(), days, &self.config)
+    }
+
+    fn daily_stats_at(&self, now: i64, days: usize) -> Result<DailyStatsResponse, CoreError> {
+        if !(1..=31).contains(&days) {
+            return Err(CoreError::InvalidDailyStatsDays);
+        }
+        self.storage.daily_stats_at(now, days, &self.config)
     }
 
     fn status_at_with_persistence(
@@ -746,6 +833,43 @@ impl Storage {
             .map_err(CoreError::from)
     }
 
+    fn session_for_document(
+        &self,
+        session_id: &str,
+        document_id: &str,
+    ) -> Result<Option<SessionRow>, CoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, started_at, last_edit_at, ended_at, status, tracking_origin,
+                        inserted_chars, deleted_chars, net_chars, active_seconds, idle_seconds,
+                        writing_inserted_units, writing_deleted_units, writing_net_units,
+                        writing_count_version
+                 FROM sessions WHERE id = ?1 AND document_id = ?2",
+                params![session_id, document_id],
+                |row| {
+                    Ok(SessionRow {
+                        id: row.get(0)?,
+                        started_at: row.get(1)?,
+                        last_edit_at: row.get(2)?,
+                        ended_at: row.get(3)?,
+                        status: row.get(4)?,
+                        tracking_origin: row.get(5)?,
+                        inserted_chars: row.get(6)?,
+                        deleted_chars: row.get(7)?,
+                        net_chars: row.get(8)?,
+                        active_seconds: row.get(9)?,
+                        idle_seconds: row.get(10)?,
+                        writing_inserted_units: row.get(11)?,
+                        writing_deleted_units: row.get(12)?,
+                        writing_net_units: row.get(13)?,
+                        writing_count_version: row.get(14)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(CoreError::from)
+    }
+
     fn end_session(
         &self,
         session_id: &str,
@@ -754,10 +878,108 @@ impl Storage {
         idle_seconds: i64,
     ) -> Result<(), CoreError> {
         self.conn.execute(
-            "UPDATE sessions SET status = 'ended', ended_at = ?2, active_seconds = ?3, idle_seconds = ?4 WHERE id = ?1",
+            "UPDATE sessions SET status = 'ended', ended_at = ?2, active_seconds = ?3, idle_seconds = ?4
+             WHERE id = ?1 AND ended_at IS NULL",
             params![session_id, ended_at, active_seconds, idle_seconds],
         )?;
         Ok(())
+    }
+
+    fn daily_stats_at(
+        &self,
+        now: i64,
+        days: usize,
+        config: &CoreConfig,
+    ) -> Result<DailyStatsResponse, CoreError> {
+        let today = local_date(now);
+        let dates: Vec<NaiveDate> = (0..days)
+            .rev()
+            .map(|offset| today - ChronoDuration::days(offset as i64))
+            .collect();
+        let mut totals: HashMap<NaiveDate, (i64, i64)> =
+            dates.iter().copied().map(|date| (date, (0, 0))).collect();
+
+        let sessions: Vec<(String, i64, i64, Option<i64>)> = {
+            let mut statement = self.conn.prepare(
+                "SELECT id, started_at, last_edit_at, ended_at
+                 FROM sessions ORDER BY started_at ASC, id ASC",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        for (session_id, started_at, last_edit_at, ended_at) in sessions {
+            if started_at > now {
+                continue;
+            }
+            let events: Vec<(i64, Option<i64>, Option<i64>)> = {
+                let mut statement = self.conn.prepare(
+                    "SELECT timestamp_ms, writing_net_units, writing_count_version
+                     FROM edit_events
+                     WHERE session_id = ?1
+                     ORDER BY timestamp_ms ASC, id ASC",
+                )?;
+                let rows = statement
+                    .query_map(params![session_id], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+
+            let effective_end = match ended_at {
+                Some(ended_at) => ended_at.min(now),
+                None => now.min(last_edit_at.saturating_add(config.session_end_seconds)),
+            }
+            .max(started_at);
+            for (timestamp_ms, writing_net_units, writing_count_version) in &events {
+                let timestamp = timestamp_ms.div_euclid(1_000);
+                if timestamp < started_at || timestamp > effective_end {
+                    continue;
+                }
+                if *writing_count_version == Some(WRITING_COUNT_VERSION) {
+                    if let Some(net_units) = writing_net_units {
+                        add_daily_net(&mut totals, local_date(timestamp), *net_units);
+                    }
+                }
+            }
+
+            let event_seconds: Vec<i64> = events
+                .iter()
+                .map(|(timestamp_ms, _, _)| timestamp_ms.div_euclid(1_000))
+                .filter(|timestamp| *timestamp >= started_at && *timestamp <= effective_end)
+                .collect();
+            for (index, event_start) in event_seconds.iter().copied().enumerate() {
+                let next_event = event_seconds.get(index + 1).copied();
+                let interval_end = next_event
+                    .unwrap_or(effective_end)
+                    .min(effective_end)
+                    .min(event_start + config.active_grace_seconds());
+                if interval_end > event_start {
+                    add_active_interval(&mut totals, event_start, interval_end);
+                }
+            }
+        }
+
+        Ok(DailyStatsResponse {
+            schema_version: 1,
+            days: dates
+                .into_iter()
+                .map(|date| {
+                    let (writing_net_units, active_seconds) =
+                        totals.get(&date).copied().unwrap_or_default();
+                    DailyWritingStat {
+                        date: date.format("%Y-%m-%d").to_string(),
+                        writing_net_units,
+                        active_seconds,
+                    }
+                })
+                .collect(),
+        })
     }
 
     fn record_event(
@@ -916,6 +1138,48 @@ impl Storage {
     }
 }
 
+fn local_date(timestamp: i64) -> NaiveDate {
+    Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|value| value.date_naive())
+        .unwrap_or_else(|| Local::now().date_naive())
+}
+
+fn local_midnight_timestamp(date: NaiveDate) -> Option<i64> {
+    let local_midnight = date.and_hms_opt(0, 0, 0)?;
+    match Local.from_local_datetime(&local_midnight) {
+        LocalResult::Single(value) => Some(value.timestamp()),
+        LocalResult::Ambiguous(earliest, _) => Some(earliest.timestamp()),
+        LocalResult::None => None,
+    }
+}
+
+fn add_daily_net(totals: &mut HashMap<NaiveDate, (i64, i64)>, date: NaiveDate, net: i64) {
+    if let Some((writing_net_units, _)) = totals.get_mut(&date) {
+        *writing_net_units += net;
+    }
+}
+
+fn add_active_interval(totals: &mut HashMap<NaiveDate, (i64, i64)>, start: i64, end: i64) {
+    let mut cursor = start;
+    while cursor < end {
+        let date = local_date(cursor);
+        let next_day = date
+            .checked_add_signed(ChronoDuration::days(1))
+            .and_then(local_midnight_timestamp)
+            .filter(|boundary| *boundary > cursor);
+        let segment_end = next_day.map_or(end, |boundary| end.min(boundary));
+        if let Some((_, active_seconds)) = totals.get_mut(&date) {
+            *active_seconds += segment_end.saturating_sub(cursor);
+        }
+        if segment_end <= cursor {
+            break;
+        }
+        cursor = segment_end;
+    }
+}
+
 fn writing_net(event: &EditEvent) -> Option<i64> {
     event
         .writing_inserted_units
@@ -946,6 +1210,8 @@ fn debug_core_event(_event: &EditEvent) {}
 
 #[cfg(test)]
 mod tests {
+    use chrono::Datelike;
+
     use super::*;
 
     fn config() -> CoreConfig {
@@ -991,6 +1257,25 @@ mod tests {
             size: 12,
             recovery_path: None,
         }
+    }
+
+    fn local_timestamp(date: NaiveDate, hour: u32, minute: u32, second: u32) -> i64 {
+        Local
+            .with_ymd_and_hms(date.year(), date.month(), date.day(), hour, minute, second)
+            .single()
+            .expect("valid local timestamp")
+            .timestamp()
+    }
+
+    fn insert_document(database: &Storage, id: &str, path: &str) {
+        database
+            .conn
+            .execute(
+                "INSERT INTO documents (id, path, created_at, updated_at, last_hash, last_mtime_ms, last_size)
+                 VALUES (?1, ?2, 0, 0, '', 0, 0)",
+                params![id, path],
+            )
+            .expect("document");
     }
 
     #[test]
@@ -1265,6 +1550,195 @@ mod tests {
             .expect("session");
         assert_eq!(current.inserted_chars, 2);
         assert_eq!(current.status, "active");
+    }
+
+    #[test]
+    fn explicit_end_closes_active_session_idempotently_and_next_edit_restarts_it() {
+        let mut core = WritingCore::new(PathBuf::from(":memory:"), config()).expect("core");
+        let document_id = core.open_document(&snapshot()).expect("open");
+        let first_status = core
+            .record_edit_at(
+                event(&document_id, 1_000, "file.diff", "file_diff", 3, 0),
+                1,
+            )
+            .expect("first edit");
+        let session_id = first_status.session_id.clone().expect("session id");
+
+        assert!(core.end_current_session_at(6).expect("end active session"));
+        assert!(!core.end_current_session_at(7).expect("repeat end"));
+        let ended = core.status_at(7).expect("ended status");
+        assert_eq!(ended.state, "ended");
+        assert_eq!(ended.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(ended.session_span_seconds, 5);
+        assert_eq!(ended.session_active_seconds, 5);
+        assert_eq!(ended.session_idle_seconds, 0);
+
+        let resumed = core
+            .record_edit_at(
+                event(&document_id, 8_000, "file.diff", "file_diff", 2, 0),
+                8,
+            )
+            .expect("new edit");
+        assert_ne!(resumed.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(resumed.state, "active");
+    }
+
+    #[test]
+    fn explicit_end_target_does_not_close_a_newer_session_after_a_retry() {
+        let mut core = WritingCore::new(PathBuf::from(":memory:"), config()).expect("core");
+        let document_id = core.open_document(&snapshot()).expect("open");
+        let first = core
+            .record_edit_at(
+                event(&document_id, 1_000, "file.diff", "file_diff", 1, 0),
+                1,
+            )
+            .expect("first edit");
+        let first_session_id = first.session_id.expect("first session");
+        assert!(core
+            .end_current_session_for_at(Some(first_session_id.as_str()), 2)
+            .expect("end first session"));
+
+        let second = core
+            .record_edit_at(
+                event(&document_id, 3_000, "file.diff", "file_diff", 2, 0),
+                3,
+            )
+            .expect("second session edit");
+        let second_session_id = second.session_id.expect("second session");
+        assert!(!core
+            .end_current_session_for_at(Some(first_session_id.as_str()), 4)
+            .expect("retry first end"));
+        let current = core.status_at(4).expect("current status");
+        assert_eq!(
+            current.session_id.as_deref(),
+            Some(second_session_id.as_str())
+        );
+        assert_eq!(current.state, "active");
+    }
+
+    #[test]
+    fn explicit_end_preserves_idle_history_and_is_safe_without_a_session() {
+        let mut no_session = WritingCore::new(PathBuf::from(":memory:"), config()).expect("core");
+        assert!(!no_session.end_current_session().expect("no-op end"));
+
+        let mut core = WritingCore::new(PathBuf::from(":memory:"), config()).expect("core");
+        let document_id = core.open_document(&snapshot()).expect("open");
+        core.record_edit_at(
+            event(&document_id, 1_000, "file.diff", "file_diff", 1, 0),
+            1,
+        )
+        .expect("edit");
+        assert!(core.end_current_session_at(31).expect("end idle session"));
+        let ended = core.status_at(31).expect("ended status");
+        assert_eq!(ended.state, "ended");
+        assert_eq!(ended.session_active_seconds, 10);
+        assert_eq!(ended.session_idle_seconds, 20);
+        assert_eq!(
+            ended.session_span_seconds,
+            ended.session_active_seconds + ended.session_idle_seconds
+        );
+    }
+
+    #[test]
+    fn daily_stats_are_seven_contiguous_local_days_with_negative_net_and_zero_fill() {
+        let database = Storage::open(Path::new(":memory:")).expect("database");
+        insert_document(&database, "doc-a", "a.md");
+        insert_document(&database, "doc-b", "b.md");
+        let today = Local::now().date_naive();
+        let now = local_timestamp(today, 0, 5, 0);
+        let old = local_timestamp(today - ChronoDuration::days(2), 12, 0, 0);
+        let current = local_timestamp(today, 0, 0, 1);
+
+        database
+            .record_event(
+                "doc-a",
+                event("doc-a", old * 1_000, "file.diff", "file_diff", 7, 0),
+                &config(),
+            )
+            .expect("old document event");
+        database
+            .record_event(
+                "doc-b",
+                event(
+                    "doc-b",
+                    current * 1_000,
+                    "editor.snapshot",
+                    "editor_snapshot",
+                    2,
+                    5,
+                ),
+                &config(),
+            )
+            .expect("current document event");
+
+        let stats = database
+            .daily_stats_at(now, 7, &config())
+            .expect("daily stats");
+        assert_eq!(stats.schema_version, 1);
+        assert_eq!(stats.days.len(), 7);
+        assert_eq!(
+            stats.days.first().unwrap().date,
+            (today - ChronoDuration::days(6))
+                .format("%Y-%m-%d")
+                .to_string()
+        );
+        assert_eq!(
+            stats.days.last().unwrap().date,
+            today.format("%Y-%m-%d").to_string()
+        );
+        assert_eq!(stats.days[4].writing_net_units, 7);
+        assert_eq!(stats.days[6].writing_net_units, -3);
+        assert_eq!(stats.days[4].active_seconds, 10);
+        assert_eq!(stats.days[6].active_seconds, 10);
+        assert!(stats
+            .days
+            .iter()
+            .any(|day| day.writing_net_units == 0 && day.active_seconds == 0));
+    }
+
+    #[test]
+    fn daily_active_time_splits_a_session_at_local_midnight_and_includes_open_tail() {
+        let database = Storage::open(Path::new(":memory:")).expect("database");
+        insert_document(&database, "doc", "test.md");
+        let today = Local::now().date_naive();
+        let yesterday = today - ChronoDuration::days(1);
+        let first = local_timestamp(yesterday, 23, 59, 55);
+        let second = local_timestamp(today, 0, 0, 20);
+        let now = local_timestamp(today, 0, 1, 0);
+
+        database
+            .record_event(
+                "doc",
+                event("doc", first * 1_000, "file.diff", "file_diff", 1, 0),
+                &config(),
+            )
+            .expect("first event");
+        database
+            .record_event(
+                "doc",
+                event("doc", second * 1_000, "file.diff", "file_diff", 2, 0),
+                &config(),
+            )
+            .expect("second event");
+        let session = database
+            .latest_session("doc")
+            .expect("session query")
+            .expect("session");
+        database
+            .end_session(&session.id, local_timestamp(today, 0, 0, 30), 20, 0)
+            .expect("manual end");
+
+        let stats = database
+            .daily_stats_at(now, 2, &config())
+            .expect("daily stats");
+        assert_eq!(stats.days[0].writing_net_units, 1);
+        assert_eq!(stats.days[1].writing_net_units, 2);
+        assert_eq!(stats.days[0].active_seconds, 5);
+        assert_eq!(stats.days[1].active_seconds, 15);
+        assert_eq!(
+            stats.days[0].active_seconds + stats.days[1].active_seconds,
+            20
+        );
     }
 
     #[test]

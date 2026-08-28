@@ -82,11 +82,14 @@ writing-monitor --foreground
 - Creation / CodeMirror live snapshot 使用共享 snapshot/dedupe 路径；保存相同内容不重复计数
 - baseline 不产生写作事件；same hash 不产生事件
 - session 分开统计：`session_span_seconds`、`session_active_seconds`、`session_idle_seconds`、`since_last_edit_seconds`
+- Desktop Creation 可结束当前 session；只关闭当前 Writing Session，不停止 tracked document、File Watch、Core 或 Markdown 保存
+- `GET /v1/stats/daily?days=7` 由 Core 汇总全部 tracked novel writing facts，返回连续本地自然日的 Writing Count 净增与 authoritative active time
 - 默认 idle threshold 为 300 秒；session end threshold 为 3600 秒
 - 可用环境变量缩短人工测试阈值：`WRITING_SPIKE_IDLE_SECONDS=10`、`WRITING_SPIKE_SESSION_END_SECONDS=60`
 - Monitor Debug 区显示 Rust 当前实际生效的 runtime timing；Debug build 可用 Apply 临时改为 10/60，release 不提供覆盖命令
 - File Diff Debug Log 显示 event_id；同一 event_id 在 Core/SQLite/React 只保留一条
 - 数据库迁移到 schema version 3，新增 `writing_*_units`、`current_writing_units` 和 `writing_count_version`；旧历史 Writing 字段保持 `NULL`
+- Daily active time 从每个 accepted edit 的 active/thinking grace interval 重建，按本机自然日切开；open session 截止到请求时刻或 session-end threshold
 
 ## Development
 
@@ -165,6 +168,8 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - 60 秒 session end 后重新创建 session
 - editor/file diff tracking origin 混合
 - runtime timing 默认值、Debug override、非法阈值拒绝与即时重算
+- explicit session end 的 active/idle/no-op、target session 幂等保护和下一次真实 edit 新建 session
+- Daily Stats 的 7 日连续日期、零填充、正/负净增、跨午夜 active-time 切分和 open session 尾段
 - 相同 event_id 的 Core 幂等持久化
 - 中文、标点、英文、数字、中英混排、Markdown heading/bold/link/image/code/frontmatter
 - Han extensions/compatibility ideographs、英文 apostrophe、`Tir → Tiru`、`5 → 59`、标点/格式变更

@@ -357,6 +357,7 @@ dependencies = [
 name = "caelorum-writing-spike"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "hex",
  "notify",
  "pulldown-cmark",
