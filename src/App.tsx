@@ -726,21 +726,28 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    let inFlight = false;
+    const readDiagnostics = mode === "editor" || monitorViewMode === "advanced";
     const timer = window.setInterval(() => {
+      if (inFlight) return;
+      inFlight = true;
       void Promise.all([
         invoke<CoreStatus>("get_core_status"),
-        invoke<WatchDiagnostics>("get_watch_diagnostics"),
+        readDiagnostics ? invoke<WatchDiagnostics>("get_watch_diagnostics") : Promise.resolve(null),
       ])
         .then(([nextStatus, nextDiagnostics]) => {
+          if (!active) return;
           receiveStatus("poll", nextStatus);
           documentIdRef.current = nextStatus.document_id ?? null;
-          setWatchDiagnostics(nextDiagnostics);
+          if (nextDiagnostics) setWatchDiagnostics(nextDiagnostics);
           setWatchError(null);
         })
-        .catch(() => setWatchError("Writing Core 不可用；正在自动重连"));
+        .catch(() => { if (active) setWatchError("Writing Core 不可用；正在自动重连"); })
+        .finally(() => { inFlight = false; });
     }, 1000);
-    return () => window.clearInterval(timer);
-  }, []);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [mode, monitorViewMode]);
 
   useEffect(() => {
     let cancelled = false;
