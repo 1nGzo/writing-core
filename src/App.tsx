@@ -448,7 +448,7 @@ function App() {
         documentId,
         content: view.state.doc.toString(),
       });
-      setSaveState(`已安全保存 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`);
+      setSaveState(`已安全保存 ${new Date().toLocaleTimeString("zh-CN", { hour12: false, timeZone: "UTC" })} UTC`);
     } catch (error) {
       setSaveState(`保存失败: ${String(error)}`);
     }
@@ -833,7 +833,7 @@ function App() {
       setWindowStateError(null);
       if (startup) {
         setWindowStateRestoreStatus(
-          `自动 restore 后读取完成 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`,
+          `自动 restore 后读取完成 ${new Date().toLocaleTimeString("zh-CN", { hour12: false, timeZone: "UTC" })} UTC`,
         );
         console.debug("[WINDOW STATE] frontend mounted", diagnostics);
       }
@@ -854,7 +854,7 @@ function App() {
           await saveWindowState(StateFlags.SIZE | StateFlags.POSITION);
           await refreshWindowStateDiagnostics();
           setWindowStateSaveStatus(
-            `已保存 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`,
+            `已保存 ${new Date().toLocaleTimeString("zh-CN", { hour12: false, timeZone: "UTC" })} UTC`,
           );
           console.debug("[WINDOW STATE] debounced save completed");
         } catch (error) {
@@ -1216,7 +1216,7 @@ function App() {
               )}
               {events.map((event) => (
                 <div className="event-row" key={event.event_id}>
-                  <time>{new Date(event.timestamp_ms).toLocaleTimeString("zh-CN", { hour12: false })}</time>
+                  <time>{new Date(event.timestamp_ms).toLocaleTimeString("zh-CN", { hour12: false, timeZone: "UTC" })} UTC</time>
                   <code title={event.event_id}>id={shortEventId(event.event_id)}</code>
                   <code>{event.source}</code>
                   <span>raw +{event.inserted_chars}</span>
